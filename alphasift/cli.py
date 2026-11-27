@@ -170,6 +170,18 @@ def main():
     sp.add_argument("--jsonl", action="store_true", help="以 JSONL 输出")
     sp.add_argument("--explain", action="store_true", help="输出紧凑可读摘要")
 
+    # relay strategy utilities
+    brp = sub.add_parser("backtest-relay", help="使用本地250日日线包回测连板接力策略")
+    brp.add_argument("--days", type=int, default=60, help="回测最近 N 个有 T+2 结算数据的交易日")
+    brp.add_argument("--pack-dir", default=None, help="CN DailyPack 路径；默认读取 ALPHASIFT_PACK_DIR")
+    brp.add_argument("--json", action="store_true", help="以 JSON 输出")
+    brp.add_argument("--output", default=None, help="额外写出回测结果 JSON")
+
+    aup = sub.add_parser("auction", help="按盘前集合竞价筛选连板接力候选")
+    aup.add_argument("--candidate-pool", default=None, help="前一日 relay 候选池 JSON 路径")
+    aup.add_argument("--json", action="store_true", help="以 JSON 输出")
+    aup.add_argument("--output", default=None, help="额外写出筛选结果 JSON")
+
     # markets
     mkp = sub.add_parser("markets", help="列出支持的多市场元数据与交易时段规范")
     mkp.add_argument("--market", default=None, help="只查看单个市场规范（cn/us/hk/jp/kr/tw/in）")
@@ -552,6 +564,36 @@ def main():
             print("\n".join(screen_result_to_jsonl(result)))
         else:
             print(dumps_strict_json(asdict(result), indent=2))
+
+    elif args.command == "backtest-relay":
+        from alphasift.pack import load_pack, pack_dir
+        from alphasift.relay import backtest_relay
+
+        config = Config.from_env()
+        result = backtest_relay(
+            load_pack(args.pack_dir) if args.pack_dir else load_pack(pack_dir(config)),
+            signal_days=args.days,
+        )
+        if args.output:
+            atomic_write_strict_json(args.output, result, indent=2)
+        if args.json:
+            print(dumps_strict_json(result, indent=2))
+        else:
+            print(_format_relay_backtest(result))
+
+    elif args.command == "auction":
+        from alphasift.relay import candidate_pool_path, load_candidate_pool, screen_auction
+
+        config = Config.from_env()
+        pool_path = Path(args.candidate_pool) if args.candidate_pool else candidate_pool_path(config)
+        picks = screen_auction(load_candidate_pool(pool_path))
+        payload = {"strategy": "relay_1to2_2to3", "candidate_pool": str(pool_path), "picks": picks}
+        if args.output:
+            atomic_write_strict_json(args.output, payload, indent=2)
+        if args.json:
+            print(dumps_strict_json(payload, indent=2))
+        else:
+            print(_format_auction_picks(picks))
 
     elif args.command == "markets":
         from alphasift.markets import MARKETS, get_market
@@ -1862,6 +1904,51 @@ def _format_screen_explain(result) -> str:
             f"{pick.final_score:>6.1f} {pick.screen_score:>6.1f} "
             f"{pick.risk_level or '-':<6} {pick.llm_sector or '-':<8} "
             f"{pick.portfolio_penalty:>4.1f} {reason[:48]}"
+        )
+    return "\n".join(lines)
+
+
+def _format_relay_backtest(result: dict) -> str:
+    def pct(value: object) -> str:
+        return "--" if value is None else f"{float(value):.2f}%"
+
+    lines = [
+        f"连板接力策略 60日回测（实际信号日 {result['actual_signal_days']} 天，"
+        f"{result['first_signal_date']} 至 {result['last_signal_date']}）",
+        f"数据包截至：{result['pack_trade_date']}",
+        "",
+        "统计项\t结果",
+        f"总交易次数\t{result['trades']}",
+        f"整体胜率\t{pct(result['win_rate_pct'])}",
+        f"单笔平均盈亏\t{pct(result['average_return_pct'])}",
+        f"累计收益率\t{pct(result['cumulative_return_pct'])}",
+        f"最大回撤\t{pct(result['max_drawdown_pct'])}",
+        "",
+        "梯队\t交易次数\t胜率\t单笔平均盈亏",
+    ]
+    for label, key in (("一进二", "1to2"), ("二进三", "2to3")):
+        tier = result["tiers"][key]
+        lines.append(
+            f"{label}\t{tier['trades']}\t{pct(tier['win_rate_pct'])}\t"
+            f"{pct(tier['average_return_pct'])}"
+        )
+    lines.extend(["", "口径说明：", *[f"- {note}" for note in result["assumptions"]]])
+    return "\n".join(lines)
+
+
+def _format_auction_picks(picks: list[dict]) -> str:
+    if not picks:
+        return "集合竞价未发现符合条件的标的。"
+    lines = [
+        "集合竞价强承接目标 Top 3",
+        "代码\t名称\t竞价开盘\t高开幅度\t竞价成交额\t占昨日成交额\t竞价强度\t所属题材",
+    ]
+    for item in picks:
+        lines.append(
+            f"{item['code']}\t{item.get('name', '')}\t{item['opening']:.2f}\t"
+            f"{item['open_gap_pct']:.2f}%\t{item['auction_amount'] / 1e8:.2f}亿\t"
+            f"{item['auction_amount_pct']:.2f}%\t{item['intensity']:.2f}\t"
+            f"{item.get('concepts') or item.get('industry') or '未映射'}"
         )
     return "\n".join(lines)
 

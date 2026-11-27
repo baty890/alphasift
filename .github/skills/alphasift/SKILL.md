@@ -51,6 +51,9 @@ alphasift quickstart --strategy balanced_alpha --max-output 8
 ```bash
 alphasift screen dual_low --no-llm
 alphasift screen sina_rule_based
+alphasift screen relay_1to2_2to3 --no-llm
+alphasift backtest-relay --days 60
+alphasift auction  # only at 09:25–09:29 China time; requires a finalized prior-close pool
 alphasift screen volume_breakout --max-output 10
 alphasift screen balanced_alpha --no-llm
 alphasift screen capital_heat

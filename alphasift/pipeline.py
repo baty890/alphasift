@@ -126,6 +126,18 @@ def screen(
         config = Config.from_env()
 
     market = get_market(market).id
+    if strategy == "relay_1to2_2to3":
+        if market != "cn":
+            raise ValueError("relay_1to2_2to3 is supported for market cn only")
+        from alphasift.relay import screen_relay
+
+        return screen_relay(
+            config=config,
+            snapshot_df=snapshot_df,
+            daily_pack=daily_pack,
+            max_output=max_output,
+            use_llm=use_llm,
+        )
 
     run_id = uuid.uuid4().hex[:12]
     degradation: list[str] = []

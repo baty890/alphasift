@@ -122,6 +122,9 @@ pip install -e .
 alphasift quickstart                            # 30 秒端到端演示
 alphasift screen dual_low --no-llm              # 跑 A 股双低纯规则筛选
 alphasift screen sina_rule_based                # 新浪量化候选：最多 20 只，自动关闭 LLM
+alphasift screen relay_1to2_2to3 --no-llm        # 首板/二板接力候选；需本地 CN 日线包
+alphasift backtest-relay                         # 本地包回测最近 60 个可结算交易日
+alphasift auction                                # 仅北京时间 9:25–9:29，读取前一日盘后确认的候选池
 alphasift screen global_value --market hk --no-llm   # 扫描港股低估值
 alphasift serve --host 127.0.0.1 --port 8765    # 打开本机交互式 Web 工作台 (/ui)
 # 或用 Docker Compose 在同一回环端口启动：
@@ -132,6 +135,7 @@ docker compose up --build -d
 ```bash
 cp .env.example .env                            # 填入 GEMINI_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY
 alphasift pack build --days 250                 # 首次构建本地 A 股日线包
+alphasift backtest-relay --days 60              # 连板接力历史模拟，不计滑点和费用
 alphasift screen dual_low --save-run
 alphasift evaluate-strategies --window 5,10,20 --explain
 alphasift daily-report --pack-dir ./data/pack/cn --output-html daily_report.html --push
@@ -191,7 +195,7 @@ alphasift daily-report --pack-dir ./data/pack/cn --output-html daily_report.html
 ---
 
 <details>
-<summary><strong>内置 12 套 YAML 策略清单（点击展开参数与覆盖范围）</strong></summary>
+<summary><strong>内置 YAML 策略清单（点击展开参数与覆盖范围）</strong></summary>
 
 | 策略名 | 适用市场 | 类型 | 核心思路 |
 |---|---|---|---|
@@ -201,6 +205,7 @@ alphasift daily-report --pack-dir ./data/pack/cn --output-html daily_report.html
 | `low_volatility_quality` | `cn` | 质量防御 | 基于日 K 20 日波动率、最大回撤与 ATR 的低波防线 |
 | `balanced_alpha` | `cn` | 均衡框架 | 跨因子综合发现，强制行业正交分散 |
 | `sina_rule_based` | `cn` | 新浪量化 | Sina 快照 + 市值/换手/涨幅硬筛，最多 20 只候选并串行获取东方财富资金流与行业题材 |
+| `relay_1to2_2to3` | `cn` | 连板接力 | 本地日线包 + Sina 识别首板/二板，候选前 15 串行补充东财资金/题材；每日 GitHub Actions 盘后运行 |
 | `momentum_quality` | `cn` | 趋势质量 | 60 日中期趋势确认 + 基本面质量硬过滤 |
 | `shrink_pullback` | `cn` | 回踩趋势 | 上升趋势中缩量回踩支撑位（需日 K） |
 | `capital_heat` | `cn` | 资金动量 | 换手与量比活跃但剔除短期过热追高 |

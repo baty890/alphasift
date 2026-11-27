@@ -220,6 +220,13 @@ class Pick:
     topic_alignment_reason: str = ""
     matched_topics: list[str] = field(default_factory=list)
     unmatched_topics: list[str] = field(default_factory=list)
+    circ_mv: float | None = None
+    main_net_inflow: float | None = None
+    consecutive_limit_ups: int | None = None
+    same_topic_limitup_count: int = 0
+    sector_assist: bool = False
+    auction_reference: float | None = None
+    prior_day_amount: float | None = None
 
 
 @dataclass

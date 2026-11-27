@@ -62,7 +62,11 @@ PICK_FIELDS = ("rank", "code", "name", "industry", "price", "pe_ratio", "pb_rati
 def strategies_for(market: str) -> list[str]:
     from alphasift.strategy import list_strategies
 
-    return sorted(info.name for info in list_strategies() if market in info.market_scope)
+    return sorted(
+        info.name
+        for info in list_strategies()
+        if market in info.market_scope and info.name != "relay_1to2_2to3"
+    )
 
 
 def _required_columns_for_market(strategies: list[str], config: Any) -> list[str]:

@@ -1,0 +1,26 @@
+name: relay_1to2_2to3
+display_name: 首板一进二 / 二进三接力
+description: 使用本地日线包和新浪快照识别首板、二板；仅对前15只候选补充东方财富资金流与题材
+version: "1.0"
+category: framework
+tags: [rule_based, relay, limit_up, sina_snapshot]
+style:
+  risk_profile: aggressive
+  holding_period: short_term
+  execution_style: breakout
+  market_regime: [rotation, risk_on]
+  capital_profile: medium_liquidity
+  ui_badge: 连板接力
+
+screening:
+  enabled: true
+  market_scope: [cn]
+  hard_filters:
+    exclude_st: true
+    amount_min: 250000000
+    market_cap_min: 2000000000
+    market_cap_max: 12000000000
+    turnover_rate_min: 5.0
+    change_pct_min: 9.5
+  ranking_hints: 连板梯队优先，结合换手健康度与资金强度排序；仅规则筛选，不启用LLM
+  max_output: 15
