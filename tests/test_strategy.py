@@ -54,6 +54,7 @@ def test_list_strategies_returns_enabled_strategies_only():
         "momentum_quality",
         "oversold_reversal",
         "quality_value",
+        "relay_1to2_2to3",
         "shrink_pullback",
         "sina_rule_based",
         "us_momentum_quality",
@@ -83,6 +84,8 @@ def test_builtin_strategy_factor_weights_are_normalized_and_diversified():
     strategies = load_all_strategies(Path("strategies"))
 
     for strat in strategies.values():
+        if strat.category == "framework":
+            continue
         weights = strat.screening.factor_weights
         assert sum(weights.values()) == pytest.approx(1.0), strat.name
         assert len([factor for factor, weight in weights.items() if weight > 0]) >= 4, strat.name
@@ -98,8 +101,12 @@ def test_cn_strategies_enforce_hard_cap_and_mirror_sync():
     repo_dir = Path("strategies")
     bundled_dir = Path("alphasift/strategies")
     strategies = load_all_strategies(repo_dir)
-    cn_strats = [s for s in strategies.values() if "cn" in s.screening.market_scope]
-    assert len(cn_strats) >= 10
+    all_cn_strats = [s for s in strategies.values() if "cn" in s.screening.market_scope]
+    assert len(all_cn_strats) >= 10
+    cn_strats = [
+        s for s in strategies.values()
+        if "cn" in s.screening.market_scope and s.category != "framework"
+    ]
     for strat in cn_strats:
         pp = strat.screening.portfolio_profile
         assert pp.get("mode") == "hard_cap", strat.name
