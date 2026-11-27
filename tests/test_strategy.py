@@ -27,8 +27,18 @@ def test_disabled_strategies_are_not_listed():
     assert "oversold_reversal" in strategies
     assert "quality_value" in strategies
     assert "shrink_pullback" in strategies
+    assert "sina_rule_based" in strategies
     assert "us_momentum_quality" in strategies
     assert "volume_breakout" in strategies
+    prefilter = strategies["sina_rule_based"].screening.candidate_prefilter
+    assert prefilter is not None
+    assert prefilter.market_cap_min == 3_000_000_000
+    assert prefilter.market_cap_max == 30_000_000_000
+    assert prefilter.turnover_rate_min == 3.0
+    assert prefilter.turnover_rate_max == 15.0
+    assert prefilter.change_pct_min == 1.0
+    assert prefilter.change_pct_max == 6.0
+    assert prefilter.max_candidates == 20
 
 
 def test_list_strategies_returns_enabled_strategies_only():
@@ -45,6 +55,7 @@ def test_list_strategies_returns_enabled_strategies_only():
         "oversold_reversal",
         "quality_value",
         "shrink_pullback",
+        "sina_rule_based",
         "us_momentum_quality",
         "volume_breakout",
     ]

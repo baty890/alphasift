@@ -121,6 +121,7 @@ pip install -e .
 ```bash
 alphasift quickstart                            # 30 秒端到端演示
 alphasift screen dual_low --no-llm              # 跑 A 股双低纯规则筛选
+alphasift screen sina_rule_based                # 新浪量化候选：最多 20 只，自动关闭 LLM
 alphasift screen global_value --market hk --no-llm   # 扫描港股低估值
 alphasift serve --host 127.0.0.1 --port 8765    # 打开本机交互式 Web 工作台 (/ui)
 # 或用 Docker Compose 在同一回环端口启动：
@@ -199,6 +200,7 @@ alphasift daily-report --pack-dir ./data/pack/cn --output-html daily_report.html
 | `quality_value` | `cn` | GARP 成长 | 中盘稳健估值 + MA20 趋势确认（`80–1200 亿` 市值） |
 | `low_volatility_quality` | `cn` | 质量防御 | 基于日 K 20 日波动率、最大回撤与 ATR 的低波防线 |
 | `balanced_alpha` | `cn` | 均衡框架 | 跨因子综合发现，强制行业正交分散 |
+| `sina_rule_based` | `cn` | 新浪量化 | Sina 快照 + 市值/换手/涨幅硬筛，最多 20 只候选并串行获取东方财富资金流与行业题材 |
 | `momentum_quality` | `cn` | 趋势质量 | 60 日中期趋势确认 + 基本面质量硬过滤 |
 | `shrink_pullback` | `cn` | 回踩趋势 | 上升趋势中缩量回踩支撑位（需日 K） |
 | `capital_heat` | `cn` | 资金动量 | 换手与量比活跃但剔除短期过热追高 |

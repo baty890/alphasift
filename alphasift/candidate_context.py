@@ -164,6 +164,7 @@ def collect_candidate_context(
     cache_dir: str | Path | None = None,
     cache_ttl_hours: int = 24,
     source_weights: dict[str, float] | None = None,
+    max_workers: int | None = None,
 ) -> tuple[list[dict[str, object]], list[str]]:
     """Collect candidate-level context rows keyed by stock code.
 
@@ -191,8 +192,11 @@ def collect_candidate_context(
         return [], []
 
     results: list[tuple[dict[str, object] | None, list[str]] | None] = [None] * len(tasks)
-    max_workers = min(_DEFAULT_MAX_WORKERS, len(tasks))
-    if max_workers <= 1:
+    worker_count = min(
+        _DEFAULT_MAX_WORKERS if max_workers is None else max(int(max_workers), 1),
+        len(tasks),
+    )
+    if worker_count <= 1:
         for index, task in enumerate(tasks):
             results[index] = _collect_candidate_context_row(
                 task,
@@ -204,7 +208,7 @@ def collect_candidate_context(
                 source_weights=source_weights,
             )
     else:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
             future_to_index = {
                 executor.submit(
                     _collect_candidate_context_row,
@@ -300,6 +304,8 @@ def _collect_candidate_context_row(
                         row["fund_flow"] = fetch_stock_fund_flow_summary(code)
                         if row["fund_flow"]:
                             successful_sources.append("fund_flow")
+                        else:
+                            errors.append(f"{code} fund_flow: EastMoney returned no daily flow data")
                     except Exception as exc:
                         if _is_rate_limit_error(exc):
                             _trip_provider_cooldown("fund_flow")
@@ -422,37 +428,40 @@ def fetch_stock_announcement_summary(code: str, *, limit: int = 3) -> str:
 
 
 def fetch_stock_fund_flow_summary(code: str) -> str:
-    import akshare as ak
+    normalized_code = _normalize_code(code)
+    if not normalized_code or not _market_for_code(normalized_code):
+        return ""
+    market_id = "1" if normalized_code.startswith("6") else "0"
+    from alphasift.snapshot import _eastmoney_get
 
-    market = _market_for_code(code)
-    if not market:
+    response = _eastmoney_get(
+        "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get",
+        params={
+            "secid": f"{market_id}.{normalized_code}",
+            "fields1": "f1,f2,f3,f7",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "klt": "101",
+            "lmt": "1",
+            "end": "20500101",
+            "iscr": "0",
+            "iscca": "0",
+        },
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://data.eastmoney.com/",
+        },
+        timeout=10,
+        request_min_interval_sec=0.8,
+        request_jitter_sec=0.8,
+    )
+    data = (response.json() or {}).get("data") or {}
+    klines = data.get("klines") or []
+    if not klines:
         return ""
-    stock_code = str(code).zfill(6)
-    hist_fn = getattr(ak, "stock_fund_flow_individual_hist_em", None)
-    if callable(hist_fn):
-        try:
-            params = inspect.signature(hist_fn).parameters
-        except (TypeError, ValueError):
-            params = {}
-        if "symbol" in params and "market" in params:
-            df = hist_fn(symbol=stock_code, market=market)
-        elif "symbol" in params or not params:
-            df = hist_fn(symbol=stock_code)
-        else:
-            df = hist_fn(stock=stock_code, market=market)
-    else:
-        df = ak.stock_individual_fund_flow(stock=stock_code, market=market)
-    if df is None or df.empty:
-        return ""
-    row = df.iloc[-1]
-    fields = []
-    for column in df.columns:
-        name = str(column)
-        if any(keyword in name for keyword in ["日期", "主力净流入", "超大单净流入", "大单净流入", "净占比"]):
-            value = _safe_text(row.get(column))
-            if value:
-                fields.append(f"{name}={value}")
-    return _compress_text("，".join(fields[:8]), max_len=420)
+    return _compress_text(
+        f"日期及资金流原始字段={klines[-1]}",
+        max_len=420,
+    )
 
 
 def fetch_stock_quote_summary(code: str) -> str:

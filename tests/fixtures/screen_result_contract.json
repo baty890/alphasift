@@ -20,6 +20,7 @@
         "price": 1520.0,
         "change_pct": 1.2,
         "amount": 3200000000.0,
+        "fund_flow": "",
         "industry": "白酒",
         "concepts": "消费龙头|高股息",
         "board_heat_score": 76.0,

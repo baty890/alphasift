@@ -7,7 +7,8 @@ from dataclasses import replace
 
 import pandas as pd
 
-from alphasift.models import HardFilterConfig
+from alphasift.models import CandidatePrefilterConfig, HardFilterConfig
+from alphasift.normalize import normalize_code
 
 logger = logging.getLogger(__name__)
 _DAILY_FILTER_DEFAULTS = {
@@ -119,6 +120,55 @@ def apply_hard_filters(df: pd.DataFrame, filters: HardFilterConfig) -> pd.DataFr
     mask = _filter_max(result, mask, ["atr_20_pct"], filters.atr_20_pct_max)
 
     return result.loc[mask].copy()
+
+
+def apply_candidate_prefilter(
+    df: pd.DataFrame,
+    config: CandidatePrefilterConfig,
+) -> pd.DataFrame:
+    """Apply a market-wide candidate gate and deterministic cap before enrichment."""
+    filtered = apply_hard_filters(
+        df,
+        HardFilterConfig(
+            exclude_st=config.exclude_st,
+            market_cap_min=config.market_cap_min,
+            market_cap_max=config.market_cap_max,
+            turnover_rate_min=config.turnover_rate_min,
+            change_pct_min=config.change_pct_min,
+            change_pct_max=config.change_pct_max,
+        ),
+    )
+    if filtered.empty:
+        return filtered
+
+    if "turnover_rate" not in filtered.columns:
+        raise SnapshotFieldMissingError(
+            "Missing required snapshot column for candidate prefilter: turnover_rate"
+        )
+    turnover = pd.to_numeric(filtered["turnover_rate"], errors="coerce")
+    filtered = filtered.loc[turnover <= config.turnover_rate_max].copy()
+    codes = filtered["code"].map(normalize_code)
+    if config.exclude_star_market:
+        filtered = filtered.loc[~codes.str.startswith(("688", "689"))].copy()
+        codes = filtered["code"].map(normalize_code)
+    if config.exclude_beijing_market:
+        filtered = filtered.loc[~codes.str.startswith(("4", "8", "92"))].copy()
+    if filtered.empty:
+        return filtered
+
+    if config.ranking != "amount_desc":
+        raise ValueError(f"Unsupported candidate prefilter ranking: {config.ranking}")
+    return (
+        filtered.assign(__candidate_code=filtered["code"].map(normalize_code))
+        .sort_values(
+            ["amount", "__candidate_code"],
+            ascending=[False, True],
+            na_position="last",
+            kind="mergesort",
+        )
+        .head(max(int(config.max_candidates), 0))
+        .drop(columns="__candidate_code")
+    )
 
 
 def hard_filter_rejection_summary(

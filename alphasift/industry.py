@@ -66,6 +66,7 @@ def enrich_industry_concepts(
     max_boards: int = 80,
     provider_cache_dir: str | Path | None | object = _CACHE_DIR_UNSET,
     provider_cache_ttl_hours: float | None = None,
+    candidate_codes: list[str] | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Attach industry/concepts columns from stable files and optional providers."""
     result = df.copy()
@@ -107,6 +108,7 @@ def enrich_industry_concepts(
         elif provider.lower() == "eastmoney":
             provider_mapping, provider_notes = fetch_eastmoney_industry_map(
                 cache_dir=provider_cache_dir,
+                candidate_codes=candidate_codes,
             )
             _merge_mapping(mapping, provider_mapping)
             notes.extend(provider_notes)
@@ -290,6 +292,7 @@ def fetch_eastmoney_industry_map(
     *,
     cache_dir: str | Path | None | object = _CACHE_DIR_UNSET,
     cache_ttl_seconds: float = _EASTMONEY_INDUSTRY_CACHE_TTL_SECONDS,
+    candidate_codes: list[str] | None = None,
 ) -> tuple[dict[str, dict[str, object]], list[str]]:
     """Return an A-share code -> industry map from EastMoney's screener API.
 
@@ -300,6 +303,13 @@ def fetch_eastmoney_industry_map(
     notes: list[str] = []
     resolved_dir = _resolve_akshare_board_cache_dir(cache_dir)
     cache_path = resolved_dir / _EASTMONEY_INDUSTRY_CACHE_NAME if resolved_dir else None
+    requested_codes = (
+        {code for value in candidate_codes or [] if (code := _normalize_code(value)).isdigit()}
+        if candidate_codes is not None
+        else None
+    )
+    if requested_codes is not None and not requested_codes:
+        return {}, ["eastmoney candidate industry skipped: no valid candidate codes"]
     stale_mapping: dict[str, dict[str, object]] | None = None
     if cache_path is not None and cache_path.is_file():
         try:
@@ -308,8 +318,12 @@ def fetch_eastmoney_industry_map(
         except Exception:
             cached = None
         if cached:
+            if requested_codes is not None:
+                cached = {code: item for code, item in cached.items() if code in requested_codes}
             age = time.time() - cache_path.stat().st_mtime
-            if age <= cache_ttl_seconds:
+            if age <= cache_ttl_seconds and cache_ttl_seconds > 0 and (
+                requested_codes is None or requested_codes <= set(cached)
+            ):
                 return cached, [f"eastmoney industry cache hit: rows={len(cached)}"]
             stale_mapping = cached
 
@@ -320,20 +334,29 @@ def fetch_eastmoney_industry_map(
         from alphasift.snapshot import _snapshot_call_timeout_seconds
         from alphasift.source_guard import call_with_timeout
 
+        call_args = {}
+        if requested_codes is not None:
+            call_args["candidate_codes"] = sorted(
+                requested_codes - set(stale_mapping or {})
+            )
         mapping = call_with_timeout(
             _fetch_eastmoney_industry_rows,
             timeout_sec=_snapshot_call_timeout_seconds(),
             label="eastmoney industry backfill",
+            **call_args,
         )
     except Exception as exc:
         if stale_mapping:
             return stale_mapping, [
                 f"eastmoney industry refresh failed, using expired cache rows={len(stale_mapping)}: {exc}"
             ]
-        return {}, [f"eastmoney industry provider failed: {exc}"]
+        return stale_mapping or {}, [f"eastmoney industry provider failed: {exc}"]
 
+    if stale_mapping:
+        _merge_mapping(stale_mapping, mapping)
+        mapping = stale_mapping
     notes.append(f"eastmoney industry map fetched: rows={len(mapping)}")
-    if cache_path is not None and mapping:
+    if cache_path is not None and mapping and requested_codes is None:
         try:
             atomic_write_strict_json(
                 cache_path,
@@ -345,7 +368,10 @@ def fetch_eastmoney_industry_map(
     return mapping, notes
 
 
-def _fetch_eastmoney_industry_rows() -> dict[str, dict[str, object]]:
+def _fetch_eastmoney_industry_rows(
+    *,
+    candidate_codes: list[str] | None = None,
+) -> dict[str, dict[str, object]]:
     from alphasift.snapshot import _eastmoney_get, _PageBudget
 
     budget = _PageBudget("eastmoney industry", per_request_timeout=30.0)
@@ -357,21 +383,33 @@ def _fetch_eastmoney_industry_rows() -> dict[str, dict[str, object]]:
     }
     mapping: dict[str, dict[str, object]] = {}
     page, page_size = 1, 2000
+    code_filter = ""
+    requested_codes = None
+    if candidate_codes is not None:
+        requested_codes = sorted(
+            {code for value in candidate_codes if (code := _normalize_code(value)).isdigit()}
+        )
+        if not requested_codes:
+            return {}
+        quoted_codes = ",".join(f'"{code}"' for code in requested_codes)
+        code_filter = f"(SECURITY_CODE+in+({quoted_codes}))"
     while True:
         resp = _eastmoney_get(
             url,
             params={
                 "st": "SECURITY_CODE",
                 "sr": "1",
-                "ps": str(page_size),
+                "ps": str(min(page_size, len(requested_codes) if requested_codes is not None else page_size)),
                 "p": str(page),
-                "sty": "SECURITY_CODE,INDUSTRY",
-                "filter": '(MARKET+in+("上交所主板","深交所主板","深交所创业板","上交所科创板","北交所"))',
+                "sty": "SECURITY_CODE,INDUSTRY,CONCEPT,CONCEPT_NAME,THEME_NAME",
+                "filter": code_filter or '(MARKET+in+("上交所主板","深交所主板","深交所创业板","上交所科创板","北交所"))',
                 "source": "SELECT_SECURITIES",
                 "client": "WEB",
             },
             headers=headers,
             timeout=budget.request_timeout(),
+            request_min_interval_sec=0.8,
+            request_jitter_sec=0.8,
         )
         budget.pages += 1
         data = resp.json()
@@ -382,8 +420,13 @@ def _fetch_eastmoney_industry_rows() -> dict[str, dict[str, object]]:
         for item in items:
             code = _normalize_code(item.get("SECURITY_CODE"))
             industry = _safe_text(item.get("INDUSTRY"))
-            if code and industry:
+            concepts = _safe_text(
+                item.get("CONCEPT") or item.get("CONCEPT_NAME") or item.get("THEME_NAME")
+            )
+            if code and (industry or concepts):
                 mapping[code] = {"industry": industry}
+                if concepts:
+                    mapping[code]["concepts"] = concepts
         if not items or page * page_size >= int(result.get("count") or 0):
             break
         page += 1

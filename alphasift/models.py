@@ -53,10 +53,26 @@ class HardFilterConfig:
 
 
 @dataclass
+class CandidatePrefilterConfig:
+    market_cap_min: float = 3_000_000_000
+    market_cap_max: float = 30_000_000_000
+    turnover_rate_min: float = 3.0
+    turnover_rate_max: float = 15.0
+    change_pct_min: float = 1.0
+    change_pct_max: float = 6.0
+    max_candidates: int = 20
+    exclude_st: bool = True
+    exclude_star_market: bool = True
+    exclude_beijing_market: bool = True
+    ranking: str = "amount_desc"
+
+
+@dataclass
 class ScreeningConfig:
     enabled: bool = False
     market_scope: list[str] = field(default_factory=lambda: ["cn"])
     hard_filters: HardFilterConfig = field(default_factory=HardFilterConfig)
+    candidate_prefilter: CandidatePrefilterConfig | None = None
     tech_weight: float = 0.35
     factor_weights: dict[str, float] = field(default_factory=dict)
     scoring_profile: dict[str, Any] = field(default_factory=dict)
@@ -125,6 +141,7 @@ class Pick:
     price: float = 0.0
     change_pct: float = 0.0
     amount: float = 0.0
+    fund_flow: str = ""
     total_mv: float | None = None
     turnover_rate: float | None = None
     volume_ratio: float | None = None

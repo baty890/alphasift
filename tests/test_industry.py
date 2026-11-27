@@ -3,6 +3,7 @@ import sys
 
 import pandas as pd
 
+import alphasift.industry as industry
 from alphasift.industry import (
     enrich_industry_concepts,
     fetch_akshare_board_map,
@@ -355,6 +356,42 @@ def test_fetch_akshare_board_map_limits_and_merges_parallel_results(monkeypatch)
     assert mapping["000002"]["concepts"] == "低估值"
     assert any("akshare industry boards loaded: 1/1" in note for note in notes)
     assert any("akshare concepts boards loaded: 1/1" in note for note in notes)
+
+
+def test_eastmoney_candidate_industry_request_is_code_scoped_and_throttled(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def json(self):
+            return {
+                "success": True,
+                "result": {
+                    "data": [
+                        {
+                            "SECURITY_CODE": "000001",
+                            "INDUSTRY": "银行",
+                            "CONCEPT": "中特估,低估值",
+                        }
+                    ],
+                    "count": 1,
+                },
+            }
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr("alphasift.snapshot._eastmoney_get", fake_get)
+
+    mapping = industry._fetch_eastmoney_industry_rows(candidate_codes=["000001"])
+
+    assert mapping == {"000001": {"industry": "银行", "concepts": "中特估,低估值"}}
+    assert len(calls) == 1
+    params = calls[0][1]["params"]
+    assert "000001" in params["filter"]
+    assert "000002" not in params["filter"]
+    assert calls[0][1]["request_min_interval_sec"] == 0.8
+    assert calls[0][1]["request_jitter_sec"] == 0.8
 
 
 def test_eastmoney_industry_backfill_is_bounded_by_the_snapshot_budget(tmp_path, monkeypatch):

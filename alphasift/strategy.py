@@ -10,6 +10,7 @@ from pathlib import Path
 import yaml
 
 from alphasift.models import (
+    CandidatePrefilterConfig,
     HardFilterConfig,
     ScreeningConfig,
     Strategy,
@@ -34,6 +35,7 @@ _SCREENING_KEYS = {
     "enabled",
     "market_scope",
     "hard_filters",
+    "candidate_prefilter",
     "tech_weight",
     "factor_weights",
     "scoring_profile",
@@ -209,11 +211,23 @@ def load_strategy(filepath: Path) -> Strategy:
     _raise_unknown_keys(hf_data, _HARD_FILTER_KEYS, f"hard_filters section of {filepath.name}")
 
     hard_filters = HardFilterConfig(**hf_data)
+    prefilter_data = screening_data.get("candidate_prefilter")
+    candidate_prefilter = None
+    if prefilter_data is not None:
+        if not isinstance(prefilter_data, dict):
+            raise ValueError(f"Invalid candidate_prefilter section in strategy file: {filepath}")
+        _raise_unknown_keys(
+            prefilter_data,
+            set(CandidatePrefilterConfig.__dataclass_fields__),
+            f"candidate_prefilter section of {filepath.name}",
+        )
+        candidate_prefilter = CandidatePrefilterConfig(**prefilter_data)
 
     screening = ScreeningConfig(
         enabled=screening_data.get("enabled", False),
         market_scope=screening_data.get("market_scope", ["cn"]),
         hard_filters=hard_filters,
+        candidate_prefilter=candidate_prefilter,
         tech_weight=screening_data.get("tech_weight", 0.35),
         factor_weights=screening_data.get("factor_weights", {}),
         scoring_profile=_scoring_profile(screening_data, filepath),

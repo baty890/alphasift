@@ -19,7 +19,11 @@ def _offline_data_side_effects(monkeypatch):
     """
     import alphasift.industry as industry
 
-    def _no_network_industry_rows():
+    fetch_candidate_rows = industry._fetch_eastmoney_industry_rows
+
+    def _no_network_industry_rows(*, candidate_codes=None):
+        if candidate_codes is not None:
+            return fetch_candidate_rows(candidate_codes=candidate_codes)
         raise RuntimeError("network disabled in tests")
 
     monkeypatch.setattr(industry, "_fetch_eastmoney_industry_rows", _no_network_industry_rows)

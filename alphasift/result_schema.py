@@ -57,6 +57,7 @@ SCREEN_RESULT_SCHEMA: dict[str, object] = {
         "portfolio_flags",
         "industry",
         "concepts",
+        "fund_flow",
         "topic_alignment_status",
         "topic_alignment_role",
         "topic_alignment_reason",

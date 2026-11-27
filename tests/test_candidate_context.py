@@ -22,13 +22,12 @@ def test_collect_candidate_context_uses_requested_providers(monkeypatch):
                 {"发布时间": "2026-04-28", "文章来源": "测试", "新闻标题": f"{symbol} 获资金关注"},
             ])
 
-        @staticmethod
-        def stock_individual_fund_flow(stock, market):
-            return pd.DataFrame([
-                {"日期": "2026-04-28", "主力净流入-净额": "1000万", "主力净流入-净占比": "3.5%"},
-            ])
-
     monkeypatch.setitem(__import__("sys").modules, "akshare", FakeAkshare)
+    monkeypatch.setattr(
+        candidate_context,
+        "fetch_stock_fund_flow_summary",
+        lambda code: "主力净流入=1000万",
+    )
     candidates = pd.DataFrame([{"code": 1.0, "name": "平安银行"}])
 
     rows, errors = collect_candidate_context(
@@ -216,11 +215,8 @@ def test_collect_candidate_context_partial_sources_have_partial_confidence(monke
                 {"发布时间": "2026-04-28", "新闻标题": f"{symbol} 获资金关注"},
             ])
 
-        @staticmethod
-        def stock_individual_fund_flow(stock, market):
-            return pd.DataFrame()
-
     monkeypatch.setitem(__import__("sys").modules, "akshare", FakeAkshare)
+    monkeypatch.setattr(candidate_context, "fetch_stock_fund_flow_summary", lambda code: "")
     candidates = pd.DataFrame([{"code": "000001", "name": "平安银行"}])
 
     rows, errors = collect_candidate_context(
@@ -228,7 +224,7 @@ def test_collect_candidate_context_partial_sources_have_partial_confidence(monke
         providers=["news", "fund_flow"],
     )
 
-    assert errors == []
+    assert errors == ["000001 fund_flow: EastMoney returned no daily flow data"]
     assert rows[0]["source_count"] == 1
     assert rows[0]["source_confidence"] == 0.5
     assert rows[0]["source_weight_score"] == 0.4643
@@ -378,34 +374,94 @@ def test_fetch_cn_market_news_dedupes_filters_noise_and_falls_back(monkeypatch, 
     assert search_stock_news_via_web("test query") == []
 
 
-def test_fetch_stock_fund_flow_summary_supports_akshare_1_20_rename(monkeypatch):
-    seen_calls: list[tuple[str, dict[str, object]]] = []
+def test_fetch_stock_fund_flow_summary_uses_throttled_eastmoney_request(monkeypatch):
+    seen_calls = []
 
-    class FakeAkNew:
-        @staticmethod
-        def stock_fund_flow_individual_hist_em(symbol):
-            seen_calls.append(("new", {"symbol": symbol}))
-            return pd.DataFrame([
-                {"日期": "2026-11-24", "主力净流入-净额": "2.1亿", "主力净流入-净占比": "6.2%"},
-            ])
+    class FakeResponse:
+        def json(self):
+            return {"data": {"klines": ["2026-11-24,2.1亿,6.2%"]}}
 
-    monkeypatch.setitem(__import__("sys").modules, "akshare", FakeAkNew)
-    summary_new = fetch_stock_fund_flow_summary("600519")
-    assert seen_calls == [("new", {"symbol": "600519"})]
-    assert "主力净流入-净额=2.1亿" in summary_new
+    def fake_get(url, **kwargs):
+        seen_calls.append((url, kwargs))
+        return FakeResponse()
 
-    class FakeAkLegacy:
-        @staticmethod
-        def stock_individual_fund_flow(stock, market):
-            seen_calls.append(("legacy", {"stock": stock, "market": market}))
-            return pd.DataFrame([
-                {"日期": "2026-11-24", "主力净流入-净额": "-800万"},
-            ])
+    monkeypatch.setattr("alphasift.snapshot._eastmoney_get", fake_get)
 
-    monkeypatch.setitem(__import__("sys").modules, "akshare", FakeAkLegacy)
-    summary_legacy = fetch_stock_fund_flow_summary("000001")
-    assert seen_calls[-1] == ("legacy", {"stock": "000001", "market": "sz"})
-    assert "主力净流入-净额=-800万" in summary_legacy
+    summary = fetch_stock_fund_flow_summary("600519")
+
+    assert len(seen_calls) == 1
+    url, kwargs = seen_calls[0]
+    assert url.endswith("/api/qt/stock/fflow/kline/get")
+    assert kwargs["params"]["secid"] == "1.600519"
+    assert kwargs["request_min_interval_sec"] == 0.8
+    assert kwargs["request_jitter_sec"] == 0.8
+    assert "2026-11-24,2.1亿,6.2%" in summary
+
+
+def test_eastmoney_candidate_interval_uses_0_8s_plus_random_jitter(monkeypatch):
+    events = []
+
+    class FakeResponse:
+        def json(self):
+            return {"data": {"klines": ["2026-11-24,flow"]}}
+
+        def raise_for_status(self):
+            events.append("raise")
+
+    class FakeSession:
+        def get(self, url, **kwargs):
+            events.append(("get", url))
+            return FakeResponse()
+
+    monkeypatch.setattr("alphasift.snapshot._EM_SESSION", FakeSession())
+    monkeypatch.setattr("alphasift.snapshot._EM_LAST_REQUEST_AT", 99.95)
+    times = iter([100.0, 100.1])
+    monkeypatch.setattr("alphasift.snapshot.time.monotonic", lambda: next(times))
+    monkeypatch.setattr("alphasift.snapshot.time.sleep", lambda seconds: events.append(("sleep", seconds)))
+    monkeypatch.setattr("alphasift.snapshot.random.uniform", lambda low, high: 0.4)
+    monkeypatch.setenv("ALPHASIFT_EASTMONEY_MIN_INTERVAL_SEC", "0")
+    monkeypatch.setenv("ALPHASIFT_EASTMONEY_JITTER_SEC", "0")
+
+    candidate_context.fetch_stock_fund_flow_summary("600000")
+
+    assert events[0][0] == "sleep"
+    assert abs(events[0][1] - 1.15) < 1e-9
+    assert events[1][0] == "get"
+
+
+def test_collect_candidate_context_can_serialize_provider_workers(monkeypatch):
+    events = []
+    active = 0
+    max_active = 0
+
+    def collect_row(candidate, **kwargs):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        events.append(f"start:{candidate['code']}")
+        events.append(f"end:{candidate['code']}")
+        active -= 1
+        return {"code": candidate["code"], "fund_flow": "flow"}, []
+
+    monkeypatch.setattr(candidate_context, "_collect_candidate_context_row", collect_row)
+    candidates = pd.DataFrame(
+        [{"code": f"60000{index}", "name": f"Stock {index}"} for index in range(3)]
+    )
+
+    rows, errors = collect_candidate_context(
+        candidates,
+        providers=["fund_flow"],
+        max_workers=1,
+    )
+
+    assert not errors
+    assert len(rows) == 3
+    assert max_active == 1
+    assert events == [
+        "start:600000", "end:600000",
+        "start:600001", "end:600001",
+        "start:600002", "end:600002",
+    ]
 
 
 def test_fund_flow_rate_limit_trips_circuit_breaker_and_collapses_errors(monkeypatch):

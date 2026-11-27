@@ -732,7 +732,13 @@ def _fetch_em_datacenter() -> pd.DataFrame:
     return _normalize(df, source="em_datacenter")
 
 
-def _eastmoney_get(url: str, **kwargs) -> requests.Response:
+def _eastmoney_get(
+    url: str,
+    *,
+    request_min_interval_sec: float | None = None,
+    request_jitter_sec: float | None = None,
+    **kwargs,
+) -> requests.Response:
     """GET EastMoney endpoints through one throttled shared session.
 
     EastMoney endpoints are useful but more sensitive to bursty access than
@@ -745,7 +751,14 @@ def _eastmoney_get(url: str, **kwargs) -> requests.Response:
         if _EM_SESSION is None:
             _EM_SESSION = _build_eastmoney_session()
         elapsed = time.monotonic() - _EM_LAST_REQUEST_AT
-        interval = _eastmoney_request_interval_seconds()
+        interval = (
+            _eastmoney_request_interval_seconds()
+            if request_min_interval_sec is None and request_jitter_sec is None
+            else _eastmoney_request_interval_seconds(
+                min_interval_sec=request_min_interval_sec,
+                jitter_sec=request_jitter_sec,
+            )
+        )
         if elapsed < interval:
             time.sleep(interval - elapsed)
         response = _EM_SESSION.get(url, **kwargs)
@@ -769,14 +782,20 @@ def _build_eastmoney_session() -> requests.Session:
     return session
 
 
-def _eastmoney_request_interval_seconds() -> float:
-    min_interval = _float_env(
-        "ALPHASIFT_EASTMONEY_MIN_INTERVAL_SEC",
-        _EM_REQUEST_MIN_INTERVAL_SECONDS,
+def _eastmoney_request_interval_seconds(
+    *,
+    min_interval_sec: float | None = None,
+    jitter_sec: float | None = None,
+) -> float:
+    min_interval = (
+        _float_env("ALPHASIFT_EASTMONEY_MIN_INTERVAL_SEC", _EM_REQUEST_MIN_INTERVAL_SECONDS)
+        if min_interval_sec is None
+        else max(float(min_interval_sec), 0.0)
     )
-    jitter = _float_env(
-        "ALPHASIFT_EASTMONEY_JITTER_SEC",
-        _EM_REQUEST_JITTER_SECONDS,
+    jitter = (
+        _float_env("ALPHASIFT_EASTMONEY_JITTER_SEC", _EM_REQUEST_JITTER_SECONDS)
+        if jitter_sec is None
+        else max(float(jitter_sec), 0.0)
     )
     return max(min_interval, 0.0) + random.uniform(0.0, max(jitter, 0.0))
 

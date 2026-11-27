@@ -50,6 +50,7 @@ alphasift quickstart --strategy balanced_alpha --max-output 8
 
 ```bash
 alphasift screen dual_low --no-llm
+alphasift screen sina_rule_based
 alphasift screen volume_breakout --max-output 10
 alphasift screen balanced_alpha --no-llm
 alphasift screen capital_heat

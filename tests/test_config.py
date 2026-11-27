@@ -144,19 +144,13 @@ def test_config_reads_snapshot_fallback_max_age_env(monkeypatch):
     assert config.snapshot_fallback_max_age_hours == 6.5
 
 
-def test_config_prefers_tushare_when_token_is_configured(monkeypatch):
+def test_config_defaults_to_sina_even_when_tushare_token_is_configured(monkeypatch):
     monkeypatch.delenv("SNAPSHOT_SOURCE_PRIORITY", raising=False)
     monkeypatch.setenv("TUSHARE_TOKEN", "token")
 
     config = Config.from_env()
 
-    assert config.snapshot_source_priority == [
-        "tushare",
-        "em_datacenter",
-        "sina",
-        "efinance",
-        "akshare_em",
-    ]
+    assert config.snapshot_source_priority == ["sina"]
 
 
 def test_config_omits_tushare_from_default_priority_without_token(monkeypatch):
@@ -166,12 +160,7 @@ def test_config_omits_tushare_from_default_priority_without_token(monkeypatch):
 
     config = Config.from_env()
 
-    assert config.snapshot_source_priority == [
-        "em_datacenter",
-        "sina",
-        "efinance",
-        "akshare_em",
-    ]
+    assert config.snapshot_source_priority == ["sina"]
 
 
 def test_config_defaults_candidate_context_providers_include_quote(monkeypatch):

@@ -15,6 +15,7 @@ from alphasift.daily import enrich_daily_features
 from alphasift.dsa_provider import apply_dsa_provider_context
 from alphasift.markets import get_market, latest_settled_close
 from alphasift.filter import (
+    apply_candidate_prefilter,
     apply_hard_filters,
     hard_filter_rejection_summary,
     hard_filter_waterfall,
@@ -137,6 +138,13 @@ def screen(
 
     strat = strategies[strategy]
     screening = strat.screening
+    candidate_prefilter = screening.candidate_prefilter
+    if candidate_prefilter is not None:
+        if market != "cn":
+            raise ValueError("Sina candidate prefilter is supported for market cn only")
+        if use_llm:
+            degradation.append("LLM disabled: sina_rule_based is a rule-based screen")
+        use_llm = False
     if market not in screening.market_scope:
         raise ValueError(
             f"Strategy '{strategy}' does not support market '{market}'. "
@@ -159,6 +167,20 @@ def screen(
 
     # 2. Fetch snapshot (or isolate a valid pre-fetched snapshot for reuse)
     required_snapshot_columns = _required_snapshot_columns(snapshot_filters)
+    if candidate_prefilter is not None:
+        required_snapshot_columns = list(
+            dict.fromkeys(
+                [
+                    *required_snapshot_columns,
+                    "code",
+                    "name",
+                    "total_mv",
+                    "turnover_rate",
+                    "change_pct",
+                    "amount",
+                ]
+            )
+        )
     if snapshot_df is not None:
         supplied_market = str(snapshot_df.attrs.get("market") or "").strip().lower()
         if supplied_market and supplied_market != market:
@@ -188,12 +210,29 @@ def screen(
         )
     else:
         snapshot_df = fetch_snapshot_with_fallback(
-            config.snapshot_source_priority,
+            ["sina"] if candidate_prefilter is not None else config.snapshot_source_priority,
             required_columns=required_snapshot_columns,
-            fallback_snapshot_path=config.fallback_snapshot_path,
+            fallback_snapshot_path=(
+                None if candidate_prefilter is not None else config.fallback_snapshot_path
+            ),
             fallback_max_age_hours=config.snapshot_fallback_max_age_hours,
             market=market,
             source_health_path=config.source_health_path,
+        )
+    snapshot_count = len(snapshot_df)
+    snapshot_source = str(snapshot_df.attrs.get("snapshot_source", ""))
+    if candidate_prefilter is not None:
+        if snapshot_source != "sina":
+            raise RuntimeError(
+                "sina_rule_based requires a live Sina snapshot; "
+                f"received snapshot source {snapshot_source or '(unknown)'}"
+            )
+        before_prefilter = len(snapshot_df)
+        snapshot_df = apply_candidate_prefilter(snapshot_df, candidate_prefilter)
+        degradation.append(
+            "Sina candidate prefilter: "
+            f"{before_prefilter} -> {len(snapshot_df)} "
+            f"(max {candidate_prefilter.max_candidates}, ranked by amount desc/code asc)"
         )
     effective_industry_map_files = (
         list(industry_map_files)
@@ -212,7 +251,28 @@ def screen(
             f"Industry provider {effective_industry_provider} skipped: A-share only (market={market})"
         )
         effective_industry_provider = "none"
-    if effective_industry_map_files or effective_industry_provider not in {"", "none", "off", "false"}:
+    if candidate_prefilter is not None:
+        if effective_industry_provider not in {"", "none", "off", "false", "eastmoney"}:
+            degradation.append(
+                f"Industry provider {effective_industry_provider} ignored: "
+                "sina_rule_based uses candidate-scoped EastMoney requests"
+            )
+        snapshot_df, industry_notes = enrich_industry_concepts(
+            snapshot_df,
+            map_files=effective_industry_map_files,
+            provider="eastmoney",
+            provider_cache_dir=config.industry_provider_cache_dir,
+            candidate_codes=snapshot_df["code"].astype(str).tolist(),
+        )
+        degradation.extend(f"Industry/concepts enrichment: {item}" for item in industry_notes)
+        missing_industry = int(snapshot_df["industry"].fillna("").astype(str).str.strip().eq("").sum())
+        missing_concepts = int(snapshot_df["concepts"].fillna("").astype(str).str.strip().eq("").sum())
+        if missing_industry or missing_concepts:
+            degradation.append(
+                "EastMoney candidate labels unavailable: "
+                f"industry_missing={missing_industry}, concepts_missing={missing_concepts}"
+            )
+    elif effective_industry_map_files or effective_industry_provider not in {"", "none", "off", "false"}:
         snapshot_df, industry_notes = enrich_industry_concepts(
             snapshot_df,
             map_files=effective_industry_map_files,
@@ -223,7 +283,8 @@ def screen(
         )
         degradation.extend(f"Industry/concepts enrichment: {item}" for item in industry_notes)
     elif (
-        market == "cn"
+        candidate_prefilter is None
+        and market == "cn"
         and config.industry_auto_backfill
         and _industry_coverage(snapshot_df) < _INDUSTRY_BACKFILL_MIN_COVERAGE
     ):
@@ -239,8 +300,35 @@ def screen(
         else:
             for item in industry_notes:
                 logger.info("Industry auto-backfill: %s", item)
-    snapshot_count = len(snapshot_df)
-    snapshot_source = str(snapshot_df.attrs.get("snapshot_source", ""))
+    if candidate_prefilter is not None and not snapshot_df.empty:
+        candidate_rows, candidate_errors = collect_candidate_context(
+            snapshot_df,
+            max_rows=candidate_prefilter.max_candidates,
+            providers=["fund_flow"],
+            cache_dir=(
+                config.llm_candidate_context_cache_dir or (config.data_dir / "candidate_context")
+                if config.llm_candidate_context_cache_enabled
+                else None
+            ),
+            cache_ttl_hours=config.llm_candidate_context_cache_ttl_hours,
+            max_workers=1,
+        )
+        fund_flow_by_code = {
+            normalize_code(row.get("code")): str(row.get("fund_flow") or "")
+            for row in candidate_rows
+        }
+        snapshot_df["fund_flow"] = snapshot_df["code"].map(
+            lambda code: fund_flow_by_code.get(normalize_code(code), "")
+        )
+        if candidate_errors:
+            degradation.extend(
+                f"EastMoney candidate fund-flow: {error}" for error in candidate_errors
+            )
+        missing_flow = int(snapshot_df["fund_flow"].astype(str).str.strip().eq("").sum())
+        if missing_flow:
+            degradation.append(
+                f"EastMoney candidate fund-flow unavailable: {missing_flow}/{len(snapshot_df)} candidates"
+            )
     source_errors = [str(item) for item in snapshot_df.attrs.get("source_errors", [])]
     for item in snapshot_df.attrs.get("source_order_notes", []):
         logger.info("%s", item)
@@ -708,6 +796,7 @@ def _df_to_picks(df: pd.DataFrame) -> list[Pick]:
             price=_safe_float(row.get("price", row.get("最新价"))) or 0.0,
             change_pct=_safe_float(row.get("change_pct", row.get("涨跌幅"))) or 0.0,
             amount=_safe_float(row.get("amount", row.get("成交额"))) or 0.0,
+            fund_flow=_safe_text(row.get("fund_flow")),
             total_mv=_safe_float(row.get("total_mv", row.get("总市值"))),
             turnover_rate=_safe_float(row.get("turnover_rate", row.get("换手率"))),
             volume_ratio=_safe_float(row.get("volume_ratio", row.get("量比"))),

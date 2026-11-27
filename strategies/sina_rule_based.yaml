@@ -1,0 +1,58 @@
+name: sina_rule_based
+display_name: 新浪量化候选
+description: 使用新浪全市场快照，按市值、换手和涨幅硬筛后选取成交额最高的 20 只，再补充候选级东方财富资金流与行业题材
+version: "1.0"
+category: framework
+tags: [rule_based, sina_snapshot, candidate_prefilter]
+style:
+  risk_profile: balanced
+  holding_period: watchlist
+  execution_style: quantitative_screen
+  market_regime: [neutral, rotation]
+  capital_profile: medium_liquidity
+  ui_badge: 新浪量化
+
+screening:
+  enabled: true
+  market_scope: [cn]
+  candidate_prefilter:
+    market_cap_min: 3000000000
+    market_cap_max: 30000000000
+    turnover_rate_min: 3.0
+    turnover_rate_max: 15.0
+    change_pct_min: 1.0
+    change_pct_max: 6.0
+    max_candidates: 20
+    exclude_st: true
+    exclude_star_market: true
+    exclude_beijing_market: true
+    ranking: amount_desc
+  hard_filters:
+    exclude_st: true
+  tech_weight: 0.35
+  factor_weights:
+    value: 0.2
+    activity: 0.2
+    stability: 0.2
+    liquidity: 0.2
+    momentum: 0.2
+  scoring_profile:
+    factor_rank_blend: 1.0
+    activity_ideal_turnover_rate: 6.0
+    stability_hot_change_pct: 5.5
+  risk_profile:
+    chase_change_pct: 6.0
+    abnormal_volume_ratio: 8.0
+    high_turnover_rate: 15.0
+  portfolio_profile:
+    mode: hard_cap
+    max_same_bucket: 1
+    concentration_penalty: 4.5
+    buckets:
+      金融: [券商, 银行, 保险, 多元金融]
+      消费: [白酒, 食品, 家电, 零售, 消费]
+      医药: [医药, 中药, 医疗器械, 生物制品, 化学制药]
+      科技电子: [半导体, 电子元件, 消费电子, 计算机, 通信设备]
+      新能源: [新能源, 光伏, 锂电, 电池, 储能]
+      周期资源: [钢铁, 煤炭, 有色, 化工, 石油天然气]
+  max_output: 20

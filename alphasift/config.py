@@ -20,8 +20,8 @@ _PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_POST_ANALYZERS = ["scorecard"]
 DEFAULT_LLM_MODEL = "gemini/gemini-3.8-flash"
 DEFAULT_GEMINI_FALLBACK_MODELS = ["gemini/gemini-4-hydrogen"]
-DEFAULT_SNAPSHOT_SOURCE_PRIORITY = ["em_datacenter", "sina", "efinance", "akshare_em"]
-TUSHARE_FIRST_SOURCE_PRIORITY = ["tushare", "em_datacenter", "sina", "efinance", "akshare_em"]
+DEFAULT_SNAPSHOT_SOURCE_PRIORITY = ["sina"]
+TUSHARE_FIRST_SOURCE_PRIORITY = ["tushare", *DEFAULT_SNAPSHOT_SOURCE_PRIORITY]
 _ENV_FILE_CACHE: dict[Path, tuple[tuple[int, int], dict[str, str]]] = {}
 _APPLIED_ENV_FILE_VALUES: dict[str, str] = {}
 
@@ -126,8 +126,6 @@ def _resolve_snapshot_source_priority() -> list[str]:
     explicit = os.getenv("SNAPSHOT_SOURCE_PRIORITY")
     if explicit is not None:
         return [s.strip() for s in explicit.split(",") if s.strip()]
-    if _has_tushare_token():
-        return list(TUSHARE_FIRST_SOURCE_PRIORITY)
     return list(DEFAULT_SNAPSHOT_SOURCE_PRIORITY)
 
 
