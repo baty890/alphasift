@@ -227,6 +227,11 @@ class Pick:
     sector_assist: bool = False
     auction_reference: float | None = None
     prior_day_amount: float | None = None
+    board: str = ""
+    last_seal_time: str | None = None
+    broken_board_count: float | None = None
+    seal_amount: float | None = None
+    seal_amount_yi: float | None = None
 
 
 @dataclass

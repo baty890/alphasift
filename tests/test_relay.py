@@ -14,6 +14,11 @@ from alphasift.config import Config
 from alphasift.pack import DailyPack, FIELDS
 from alphasift.relay import (
     STRATEGY_NAME,
+    _first_board_score,
+    _first_board_seal_fields,
+    _is_main_board,
+    _limit_up,
+    _streak_through_day,
     backtest_relay,
     screen_auction,
     screen_relay,
@@ -48,7 +53,10 @@ def test_relay_screens_top_15_and_only_enriches_final_candidates(tmp_path: Path,
     valid_codes = [f"{number:06d}" for number in range(1, 21)]
     boundary_codes = ["000022", "000023"]
     rejected_codes = [f"{number:06d}" for number in range(24, 30)]
-    codes = [*valid_codes, *boundary_codes, *rejected_codes, "000021", "688001", "830001"]
+    codes = [
+        *valid_codes, *boundary_codes, *rejected_codes, "000021", "688001", "830001",
+        "300001", "300002",
+    ]
     two_boards = {*valid_codes[:8], "000023"}
     pack = _pack_for_screen(codes, two_boards)
     rows = []
@@ -79,12 +87,29 @@ def test_relay_screens_top_15_and_only_enriches_final_candidates(tmp_path: Path,
             {"code": "000021", "name": "ST样本", "price": 11, "change_pct": 10, "amount": 3e8, "turnover_rate": 10, "circ_mv": 5e9},
             {"code": "688001", "name": "科创样本", "price": 11, "change_pct": 10, "amount": 3e8, "turnover_rate": 10, "circ_mv": 5e9},
             {"code": "830001", "name": "北交所样本", "price": 11, "change_pct": 10, "amount": 3e8, "turnover_rate": 10, "circ_mv": 5e9},
+            {"code": "300001", "name": "创业板涨停", "price": 12, "change_pct": 19.5, "amount": 350_000_000, "turnover_rate": 11.5, "circ_mv": 5e9},
+            {"code": "300002", "name": "创业板普通大阳线", "price": 11, "change_pct": 10, "amount": 350_000_000, "turnover_rate": 11.5, "circ_mv": 5e9},
         ]
     )
     snapshot = pd.DataFrame(rows)
     snapshot.attrs.update(snapshot_source="sina", quote_date="2026-01-03", market="cn")
     calls: list[str] = []
     monkeypatch.setattr(candidate_context, "fetch_stock_fund_flow_summary", lambda code: calls.append(code) or "日期及资金流原始字段=2026-01-02,100000000,0.2")
+    seal_pool = {
+        "000020": {
+            "last_seal_time": "09:30:00",
+            "broken_board_count": 1,
+            "seal_amount": 30_000_000.0,
+            "seal_amount_yi": 0.3,
+        },
+        "000018": {
+            "last_seal_time": "14:30:01",
+            "broken_board_count": 0,
+            "seal_amount": 30_000_000.0,
+            "seal_amount_yi": 0.3,
+        },
+    }
+    monkeypatch.setattr(relay, "_fetch_limit_up_pool", lambda _trade_date: (seal_pool, None))
 
     def enrich(frame, **kwargs):
         assert kwargs["candidate_codes"] == frame["code"].tolist()
@@ -99,22 +124,205 @@ def test_relay_screens_top_15_and_only_enriches_final_candidates(tmp_path: Path,
 
     assert result.snapshot_source == "sina"
     assert not result.llm_ranked
-    assert result.after_filter_count == 22
+    assert result.after_filter_count == 21
     assert len(result.picks) == 15
-    assert len(calls) == 15
-    assert set(calls) == {pick.code for pick in result.picks}
+    assert len(calls) == 21
+    assert {pick.code for pick in result.picks}.issubset(set(calls))
     assert all(not pick.code.startswith(("688", "4", "8")) for pick in result.picks)
+    assert "300001" not in {pick.code for pick in result.picks}
+    assert all(pick.board == "主板" for pick in result.picks if not pick.code.startswith(("300", "301")))
+    assert "300002" not in {pick.code for pick in result.picks}
     assert all(not pick.name.startswith("ST") for pick in result.picks)
     assert all(pick.consecutive_limit_ups == 2 for pick in result.picks[:9])
     assert all(pick.consecutive_limit_ups == 1 for pick in result.picks[9:])
-    assert all(pick.sector_assist and pick.same_topic_limitup_count == 15 for pick in result.picks)
+    assert all(pick.sector_assist and pick.same_topic_limitup_count == 21 for pick in result.picks)
+    assert "000018" not in {pick.code for pick in result.picks}
     assert result.picks[0].concepts == "题材甲|共同主题"
     assert result.picks[0].main_net_inflow == 100_000_000.0
+    seal_pick = next(pick for pick in result.picks if pick.code == "000020")
+    assert seal_pick.last_seal_time == "09:30:00"
+    assert seal_pick.broken_board_count == 1.0
+    assert seal_pick.seal_amount_yi == 0.3
+    assert all(
+        pick.final_score == sum(pick.factor_scores.values())
+        for pick in result.picks
+        if pick.consecutive_limit_ups == 1
+    )
     pool = __import__("json").loads((tmp_path / "relay" / "candidate_pool.json").read_text(encoding="utf-8"))
     assert len(pool["stocks"]) == 15
     assert pool["is_final"] is False
     assert pool["pool_status"] == "provisional_intraday"
     assert pool["stocks"][0]["auction_reference"] == 35_000_000.0
+    assert all(
+        "selection_score" in stock for stock in pool["stocks"]
+        if stock["consecutive_limit_ups"] == 1
+    )
+    serialized_seal_pick = next(stock for stock in pool["stocks"] if stock["code"] == "000020")
+    assert serialized_seal_pick["last_seal_time"] == "09:30:00"
+    assert serialized_seal_pick["broken_board_count"] == 1.0
+    assert serialized_seal_pick["seal_amount_yi"] == 0.3
+
+
+def test_first_board_filters_and_score_defaults():
+    assert _is_main_board("000001")
+    assert _is_main_board("600000")
+    assert not _is_main_board("300001")
+    assert not _is_main_board("688001")
+    assert _first_board_seal_fields({}) == (True, None)
+    assert _first_board_seal_fields({"最后封板时间": "14:30:00"}) == (True, 52_200)
+    assert not _first_board_seal_fields({"最后封板时间": "14:30:01"})[0]
+    assert not _first_board_seal_fields({"炸板次数": 3})[0]
+    assert not _first_board_seal_fields({"封单金额": 19_999_999})[0]
+    assert _first_board_seal_fields({"封单金额": 0.2})[0]
+
+    score, factors = _first_board_score(
+        topic_count=5,
+        turnover=13.0,
+        net_inflow=80_000_000.0,
+        seal_seconds=None,
+        has_seal_time=False,
+    )
+    assert score == 95.0
+    assert factors == {
+        "topic_heat": 35.0,
+        "turnover_golden_range": 25.0,
+        "fund_strength": 25.0,
+        "seal_quality": 10.0,
+    }
+    assert _first_board_score(
+        topic_count=0,
+        turnover=3.5,
+        net_inflow=30_000_000.0,
+        seal_seconds=9 * 3600 + 59 * 60 + 59,
+        has_seal_time=True,
+    )[1]["seal_quality"] == 15.0
+    assert _first_board_score(
+        topic_count=0,
+        turnover=3.5,
+        net_inflow=30_000_000.0,
+        seal_seconds=10 * 3600,
+        has_seal_time=True,
+    )[1]["seal_quality"] == 10.0
+
+
+def test_limit_up_pool_fetch_maps_akshare_fields_and_fails_closed(monkeypatch):
+    import sys
+    import types
+
+    import alphasift.relay as relay
+
+    date_key = "20990101"
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        types.SimpleNamespace(
+            stock_zt_pool_em=lambda date: pd.DataFrame(
+                [
+                    {
+                        "代码": "000001",
+                        "最后封板时间": "09:31:00",
+                        "炸板次数": 2,
+                        "封板资金": 80_000_000.0,
+                    }
+                ]
+            )
+        ),
+    )
+    relay._LIMIT_UP_POOL_CACHE.pop(date_key, None)
+    relay._LIMIT_UP_POOL_FAILED_UNTIL.pop(date_key, None)
+    mapping, error = relay._fetch_limit_up_pool(date_key)
+    assert error is None
+    assert mapping["000001"] == {
+        "last_seal_time": "09:31:00",
+        "broken_board_count": 2.0,
+        "seal_amount": 80_000_000.0,
+        "seal_amount_yi": 0.8,
+    }
+
+    failure_date = "20990102"
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        types.SimpleNamespace(
+            stock_zt_pool_em=lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("offline"))
+        ),
+    )
+    relay._LIMIT_UP_POOL_CACHE.pop(failure_date, None)
+    relay._LIMIT_UP_POOL_FAILED_UNTIL.pop(failure_date, None)
+    mapping, error = relay._fetch_limit_up_pool(failure_date)
+    assert mapping == {}
+    assert error and "将留空" in error
+    mapping, error = relay._fetch_limit_up_pool(failure_date)
+    assert mapping == {}
+    assert error and "冷却期" in error
+
+
+def test_board_specific_limit_up_thresholds():
+    assert _limit_up(10.95, 10.0, "600001")
+    assert not _limit_up(11.0, 10.0, "300001")
+    assert _limit_up(11.95, 10.0, "300001")
+
+    main_board_pack = _pack_for_screen(["600001"], {"600001"})
+    chinext_pack = _pack_for_screen(["300001"], {"300001"})
+    assert _streak_through_day(main_board_pack, 1, 0) == 1
+    assert _streak_through_day(chinext_pack, 1, 0) == 0
+
+
+def test_relay_board_shows_seal_fields():
+    from dashboard.relay_board import _candidate_table
+
+    table = _candidate_table(
+        [
+            {
+                "code": "000001",
+                "name": "样本",
+                "board": "主板",
+                "selection_score": 90,
+                "last_seal_time": "09:31:00",
+                "broken_board_count": 1,
+                "seal_amount_yi": 0.8,
+                "concepts": "算力|人工智能",
+            }
+        ]
+    )
+    assert table.loc[0, "最后封板时间"] == "09:31:00"
+    assert table.loc[0, "炸板次数"] == 1
+    assert table.loc[0, "封单金额(亿)"] == 0.8
+    assert table.loc[0, "精选得分"] == 90
+
+
+def test_relay_explain_uses_simplified_chinese_headers_and_board_label():
+    from alphasift.cli import _format_relay_screen_explain
+    from alphasift.models import Pick, ScreenResult
+
+    pick = Pick(
+        rank=1,
+        code="300001",
+        name="创业板样本",
+        final_score=100,
+        screen_score=100,
+        board="创业板",
+        consecutive_limit_ups=1,
+        circ_mv=5_000_000_000,
+        turnover_rate=11.5,
+        main_net_inflow=120_000_000,
+        last_seal_time="09:30:00",
+        broken_board_count=1,
+        seal_amount_yi=0.35,
+        concepts="算力|人工智能",
+        auction_reference=35_000_000,
+        same_topic_limitup_count=3,
+    )
+    result = ScreenResult(
+        strategy=STRATEGY_NAME,
+        market="cn",
+        after_filter_count=1,
+        picks=[pick],
+    )
+
+    report = _format_relay_screen_explain(result)
+    assert "精选得分\t流通市值(亿)\t换手率\t主力净流入(亿)\t最后封板时间\t炸板次数\t封单金额(亿)" in report
+    assert "300001\t创业板样本\t创业板\t1\t100\t50.00\t11.50%\t1.200\t09:30:00\t1\t0.35\t算力/人工智能\t0.35\t3" in report
 
 
 def _pack_for_backtest() -> DailyPack:
