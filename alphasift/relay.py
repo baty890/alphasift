@@ -7,6 +7,7 @@ import json
 import math
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -24,12 +25,15 @@ from alphasift.jsonutil import atomic_write_strict_json
 from alphasift.models import Pick, ScreenResult
 from alphasift.normalize import normalize_code, safe_float
 from alphasift.pack import DailyPack, load_pack, pack_dir
+from alphasift.source_guard import call_with_timeout
 from alphasift.timeutil import now_iso
 
 STRATEGY_NAME = "relay_1to2_2to3"
 MAX_CANDIDATES = 15
 MIN_AMOUNT = 250_000_000.0
-LIMIT_UP_PCT = 9.5
+MAIN_BOARD_LIMIT_UP_PCT = 9.5
+CHINEXT_LIMIT_UP_PCT = 19.5
+_PCT_FLOAT_TOLERANCE = 0.0001
 FIRST_BOARD_MIN_CIRC_MV = 2_000_000_000.0
 FIRST_BOARD_MAX_CIRC_MV = 15_000_000_000.0
 FIRST_BOARD_MIN_TURNOVER = 3.5
@@ -37,6 +41,11 @@ FIRST_BOARD_MAX_TURNOVER = 16.0
 FIRST_BOARD_MIN_NET_INFLOW = 30_000_000.0
 _CN_TZ = ZoneInfo("Asia/Shanghai")
 _AUCTION_URL = "https://hq.sinajs.cn/list={symbol}"
+_LIMIT_UP_POOL_CACHE_TTL_SECONDS = 90.0
+_LIMIT_UP_POOL_FAILURE_COOLDOWN_SECONDS = 300.0
+_LIMIT_UP_POOL_LOCK = threading.Lock()
+_LIMIT_UP_POOL_CACHE: dict[str, tuple[float, dict[str, dict[str, Any]]]] = {}
+_LIMIT_UP_POOL_FAILED_UNTIL: dict[str, float] = {}
 
 
 @dataclass(frozen=True)
@@ -77,44 +86,109 @@ def _row_value(row: dict[str, Any], names: tuple[str, ...]) -> tuple[str, object
     return None
 
 
-def _parse_seal_minutes(value: object) -> int | None:
-    match = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?::\d{2})?(?!\d)", str(value).strip())
+def _parse_seal_seconds(value: object) -> int | None:
+    match = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?::(\d{2}))?(?!\d)", str(value).strip())
     if not match:
         return None
-    hour, minute = int(match.group(1)), int(match.group(2))
-    if hour > 23 or minute > 59:
+    hour, minute, second = int(match.group(1)), int(match.group(2)), int(match.group(3) or 0)
+    if hour > 23 or minute > 59 or second > 59:
         return None
-    return hour * 60 + minute
+    return hour * 3600 + minute * 60 + second
+
+
+def _parse_seal_amount_yi(field: tuple[str, object] | None) -> float | None:
+    if not field:
+        return None
+    amount = safe_float(field[1])
+    if amount is None:
+        return None
+    name = field[0]
+    if name == "封板资金":
+        return amount / 100_000_000.0
+    if name == "seal_amount" and abs(amount) >= 10_000:
+        return amount / 100_000_000.0
+    if "亿" in name or name.endswith("_yi") or abs(amount) < 10_000:
+        return amount
+    return amount / 100_000_000.0
 
 
 def _first_board_seal_fields(row: dict[str, Any]) -> tuple[bool, int | None]:
     time_field = _row_value(row, ("last_seal_time", "seal_time", "最后封板时间", "封板时间"))
-    seal_minutes = _parse_seal_minutes(time_field[1]) if time_field else None
-    if seal_minutes is not None and seal_minutes > 14 * 60 + 30:
-        return False, seal_minutes
+    seal_seconds = _parse_seal_seconds(time_field[1]) if time_field else None
+    if seal_seconds is not None and seal_seconds > 14 * 3600 + 30 * 60:
+        return False, seal_seconds
 
     broken_field = _row_value(row, ("broken_board_count", "炸板次数"))
     if broken_field:
         broken_count = safe_float(broken_field[1])
         if broken_count is not None and broken_count > 2:
-            return False, seal_minutes
+            return False, seal_seconds
 
     amount_field = _row_value(
         row,
-        ("seal_amount_yi", "封单金额(亿)", "封单金额（亿）", "seal_amount", "封单金额", "封单额"),
+        (
+            "seal_amount_yi", "封单金额(亿)", "封单金额（亿）", "seal_amount",
+            "封板资金", "封单金额", "封单额",
+        ),
     )
     if amount_field:
-        seal_amount = safe_float(amount_field[1])
-        if seal_amount is not None:
-            amount_is_yi = (
-                "亿" in amount_field[0]
-                or amount_field[0] == "seal_amount_yi"
-                or abs(seal_amount) < 10_000
+        seal_amount_yi = _parse_seal_amount_yi(amount_field)
+        if seal_amount_yi is not None and seal_amount_yi < 0.2:
+            return False, seal_seconds
+    return True, seal_seconds
+
+
+def _fetch_limit_up_pool(
+    trade_date: str,
+) -> tuple[dict[str, dict[str, Any]], str | None]:
+    """Fetch and normalize the day's limit-up pool once, with bounded retries."""
+    cache_key = trade_date.replace("-", "")
+    now = time.monotonic()
+    with _LIMIT_UP_POOL_LOCK:
+        cached = _LIMIT_UP_POOL_CACHE.get(cache_key)
+        if cached and now - cached[0] <= _LIMIT_UP_POOL_CACHE_TTL_SECONDS:
+            return cached[1], None
+        if _LIMIT_UP_POOL_FAILED_UNTIL.get(cache_key, 0.0) > now:
+            return {}, "AKShare 涨停池暂处于失败冷却期"
+        try:
+            import akshare as ak
+
+            frame = call_with_timeout(
+                ak.stock_zt_pool_em,
+                date=cache_key,
+                timeout_sec=8.0,
+                label=f"stock_zt_pool_em:{cache_key}",
             )
-            seal_amount_yi = seal_amount if amount_is_yi else seal_amount / 100_000_000.0
-            if seal_amount_yi < 0.2:
-                return False, seal_minutes
-    return True, seal_minutes
+            mapping: dict[str, dict[str, Any]] = {}
+            if frame is not None and not frame.empty:
+                for row in frame.to_dict(orient="records"):
+                    code_field = _row_value(row, ("代码", "code", "股票代码"))
+                    code = normalize_code(code_field[1]) if code_field else ""
+                    if not code:
+                        continue
+                    time_field = _row_value(row, ("最后封板时间", "last_seal_time", "seal_time"))
+                    broken_field = _row_value(row, ("炸板次数", "broken_board_count"))
+                    amount_field = _row_value(
+                        row,
+                        ("封板资金", "封单金额", "封单额", "seal_amount"),
+                    )
+                    seal_amount = safe_float(amount_field[1]) if amount_field else None
+                    mapping[code] = {
+                        "last_seal_time": str(time_field[1]).strip() if time_field else None,
+                        "broken_board_count": (
+                            safe_float(broken_field[1]) if broken_field else None
+                        ),
+                        "seal_amount": seal_amount,
+                        "seal_amount_yi": _parse_seal_amount_yi(amount_field),
+                    }
+            _LIMIT_UP_POOL_CACHE[cache_key] = (now, mapping)
+            _LIMIT_UP_POOL_FAILED_UNTIL.pop(cache_key, None)
+            return mapping, None
+        except Exception as exc:
+            _LIMIT_UP_POOL_FAILED_UNTIL[cache_key] = (
+                now + _LIMIT_UP_POOL_FAILURE_COOLDOWN_SECONDS
+            )
+            return {}, f"AKShare 涨停池数据不可用，封板字段将留空：{exc}"
 
 
 def _first_board_score(
@@ -122,15 +196,19 @@ def _first_board_score(
     topic_count: int,
     turnover: float,
     net_inflow: float,
-    seal_minutes: int | None,
+    seal_seconds: int | None,
     has_seal_time: bool,
 ) -> tuple[float, dict[str, float]]:
     topic_score = 35.0 if topic_count >= 5 else 20.0 if topic_count >= 3 else 5.0
     turnover_score = 25.0 if 5.0 <= turnover <= 13.0 else 12.0
     flow_score = 25.0 if net_inflow >= 80_000_000.0 else 12.0
     seal_score = 10.0
-    if has_seal_time and seal_minutes is not None:
-        seal_score = 15.0 if seal_minutes < 10 * 60 else 10.0 if seal_minutes < 11 * 60 + 30 else 5.0
+    if has_seal_time and seal_seconds is not None:
+        seal_score = (
+            15.0 if seal_seconds < 10 * 3600
+            else 10.0 if seal_seconds < 11 * 3600 + 30 * 60
+            else 5.0
+        )
     scores = {
         "topic_heat": topic_score,
         "turnover_golden_range": turnover_score,
@@ -140,16 +218,28 @@ def _first_board_score(
     return sum(scores.values()), scores
 
 
+def _is_chinext(code: str) -> bool:
+    return normalize_code(code).startswith(("300", "301"))
+
+
+def _board_name(code: str) -> str:
+    return "创业板" if _is_chinext(code) else "主板"
+
+
+def _limit_up_threshold(code: str) -> float:
+    return CHINEXT_LIMIT_UP_PCT if _is_chinext(code) else MAIN_BOARD_LIMIT_UP_PCT
+
+
 def _pack_code_index(pack: DailyPack) -> dict[str, int]:
     return {str(code): index for index, code in enumerate(pack.codes)}
 
 
-def _limit_up(close: float, pre_close: float) -> bool:
+def _limit_up(close: float, pre_close: float, code: str) -> bool:
     return (
         math.isfinite(close)
         and math.isfinite(pre_close)
         and pre_close > 0
-        and (close / pre_close - 1.0) * 100.0 >= LIMIT_UP_PCT
+        and (close / pre_close - 1.0) * 100.0 >= _limit_up_threshold(code) - _PCT_FLOAT_TOLERANCE
     )
 
 
@@ -167,9 +257,10 @@ def _bar_change(pack: DailyPack, day_index: int, code_index: int) -> float | Non
 
 def _streak_through_day(pack: DailyPack, day_index: int, code_index: int) -> int:
     streak = 0
+    threshold = _limit_up_threshold(str(pack.codes[code_index]))
     for index in range(day_index, -1, -1):
         change = _bar_change(pack, index, code_index)
-        if change is None or change < LIMIT_UP_PCT:
+        if change is None or change < threshold - _PCT_FLOAT_TOLERANCE:
             break
         streak += 1
     return streak
@@ -304,6 +395,7 @@ def screen_relay(
     screen_clock = datetime.now(_CN_TZ)
     is_final = screen_clock.hour >= 15 and pack.trade_date == quote_date
 
+    limit_up_pool, limit_up_pool_note = _fetch_limit_up_pool(quote_date)
     pack_codes = _pack_code_index(pack)
     meta_by_code = (
         pack.meta.assign(code=pack.meta["code"].astype(str)).set_index("code")
@@ -320,7 +412,7 @@ def screen_relay(
         if code_index is None:
             continue
         change_pct = safe_float(row.get("change_pct"))
-        if change_pct is None or change_pct < LIMIT_UP_PCT:
+        if change_pct is None or change_pct < _limit_up_threshold(code):
             continue
         previous_streak = _streak_through_day(pack, previous_index, code_index)
         ladder = previous_streak + 1
@@ -330,6 +422,11 @@ def screen_relay(
         turnover = safe_float(row.get("turnover_rate"))
         amount = safe_float(row.get("amount"))
         price = safe_float(row.get("price"))
+        seal_row = dict(row)
+        seal_fields = limit_up_pool.get(code, {})
+        for field, value in seal_fields.items():
+            if value is not None:
+                seal_row[field] = value
         if ladder == 1 and not _is_main_board(code):
             continue
         market_cap_min, market_cap_max = (
@@ -349,15 +446,29 @@ def screen_relay(
         )
         if not turnover_min <= turnover <= turnover_max:
             continue
-        seal_passes, seal_minutes = _first_board_seal_fields(row) if ladder == 1 else (True, None)
+        seal_passes, seal_seconds = (
+            _first_board_seal_fields(seal_row) if ladder == 1 else (True, None)
+        )
         if not seal_passes:
             continue
+        seal_time_field = _row_value(
+            seal_row, ("last_seal_time", "seal_time", "最后封板时间", "封板时间")
+        )
+        broken_count_field = _row_value(seal_row, ("broken_board_count", "炸板次数"))
+        seal_amount_field = _row_value(
+            seal_row, ("seal_amount", "封板资金", "封单金额", "封单额")
+        )
+        seal_amount_yi_field = _row_value(
+            seal_row,
+            ("seal_amount_yi", "封单金额(亿)", "封单金额（亿）"),
+        )
         prior_amount = safe_float(pack.matrices["amount"][ref_index, code_index])
         health = _turnover_health(turnover, ladder)
         candidates.append(
             {
                 "code": code,
                 "name": name,
+                "board": _board_name(code),
                 "ladder": ladder,
                 "price": price,
                 "change_pct": change_pct,
@@ -372,9 +483,20 @@ def screen_relay(
                 "industry": str(meta_by_code.loc[code].get("industry", "") if code in meta_by_code.index else ""),
                 "concepts": "",
                 "fund_flow": "",
-                "seal_minutes": seal_minutes,
+                "last_seal_time": str(seal_time_field[1]) if seal_time_field else None,
+                "broken_board_count": (
+                    safe_float(broken_count_field[1]) if broken_count_field else None
+                ),
+                "seal_amount": (
+                    safe_float(seal_amount_field[1]) if seal_amount_field else None
+                ),
+                "seal_amount_yi": _parse_seal_amount_yi(
+                    seal_amount_yi_field or seal_amount_field
+                ),
+                "seal_seconds": seal_seconds,
                 "has_seal_time": _row_value(
-                    row, ("last_seal_time", "seal_time", "最后封板时间", "封板时间")
+                    seal_row,
+                    ("last_seal_time", "seal_time", "最后封板时间", "封板时间"),
                 ) is not None,
                 "same_topic_limitup_count": 0,
                 "sector_assist": False,
@@ -382,7 +504,14 @@ def screen_relay(
         )
     candidates.sort(key=lambda item: (-item["pre_score"][0], -item["pre_score"][1], -item["pre_score"][2], item["code"]))
     flow_errors: list[str] = []
-    for item in (candidate for candidate in candidates if candidate["ladder"] == 1):
+    if limit_up_pool_note:
+        flow_errors.append(limit_up_pool_note)
+    finalist_limit = min(MAX_CANDIDATES, max_output or MAX_CANDIDATES)
+    first_board_shortlist = [
+        item for item in candidates if item["ladder"] == 1
+    ][:finalist_limit]
+    first_board_shortlist_codes = {item["code"] for item in first_board_shortlist}
+    for item in first_board_shortlist:
         try:
             summary = fetch_stock_fund_flow_summary(item["code"])
         except Exception as exc:
@@ -396,14 +525,15 @@ def screen_relay(
         item for item in candidates
         if item["ladder"] != 1
         or (
-            item["main_net_inflow"] is not None
+            item["code"] in first_board_shortlist_codes
+            and item["main_net_inflow"] is not None
             and item["main_net_inflow"] >= FIRST_BOARD_MIN_NET_INFLOW
         )
     ]
 
     second_board_finalists = [
         item for item in candidates if item["ladder"] == 2
-    ][: min(MAX_CANDIDATES, max_output or MAX_CANDIDATES)]
+    ][:finalist_limit]
     finalists = [
         *[item for item in candidates if item["ladder"] == 1],
         *second_board_finalists,
@@ -457,7 +587,7 @@ def screen_relay(
                 topic_count=item["same_topic_limitup_count"],
                 turnover=item["turnover_rate"],
                 net_inflow=item["main_net_inflow"],
-                seal_minutes=item["seal_minutes"],
+                seal_seconds=item["seal_seconds"],
                 has_seal_time=item["has_seal_time"],
             )
 
@@ -471,7 +601,7 @@ def screen_relay(
             item["code"],
         )
     )
-    finalists = finalists[: min(MAX_CANDIDATES, max_output or MAX_CANDIDATES)]
+    finalists = finalists[:finalist_limit]
     picks: list[Pick] = []
     for rank, item in enumerate(finalists, 1):
         flow_ratio = _main_flow_score(item["main_net_inflow"], item["circ_mv"], item["amount"])
@@ -501,6 +631,7 @@ def screen_relay(
                 change_pct=item["change_pct"],
                 amount=item["amount"],
                 fund_flow=item["fund_flow"],
+                board=item["board"],
                 circ_mv=item["circ_mv"],
                 turnover_rate=item["turnover_rate"],
                 main_net_inflow=item["main_net_inflow"],
@@ -509,6 +640,10 @@ def screen_relay(
                 sector_assist=item["sector_assist"],
                 auction_reference=item["auction_reference"],
                 prior_day_amount=item["prior_day_amount"],
+                last_seal_time=item["last_seal_time"],
+                broken_board_count=item["broken_board_count"],
+                seal_amount=item["seal_amount"],
+                seal_amount_yi=item["seal_amount_yi"],
                 industry=item["industry"],
                 concepts=item["concepts"],
                 factor_scores=(
@@ -521,8 +656,9 @@ def screen_relay(
 
     degradation = [
         "初筛使用本地 DailyPack + Sina 快照；资金流与题材评分查询东方财富，不调用 LLM。",
+        "一进二封板字段优先由 AKShare 涨停池补齐；源不可用时字段留空并采用缺失字段默认评分。",
         "一进二先按真实主力净流入硬筛；二进三仍按原候选预排序后查询资金流。",
-        f"题材热度计数范围仅为成功映射题材的候选集合，不代表全市场涨停家数。",
+        "题材热度计数范围仅为成功映射题材的候选集合，不代表全市场涨停家数。",
         *notes,
         *flow_errors,
     ]
@@ -557,6 +693,7 @@ def screen_relay(
             {
                 "code": pick.code,
                 "name": pick.name,
+                "board": pick.board,
                 "consecutive_limit_ups": pick.consecutive_limit_ups,
                 "circ_mv": pick.circ_mv,
                 "turnover_rate": pick.turnover_rate,
@@ -565,6 +702,10 @@ def screen_relay(
                 "auction_reference": pick.auction_reference,
                 "main_net_inflow": pick.main_net_inflow,
                 "selection_score": pick.final_score if pick.consecutive_limit_ups == 1 else None,
+                "last_seal_time": pick.last_seal_time,
+                "broken_board_count": pick.broken_board_count,
+                "seal_amount": pick.seal_amount,
+                "seal_amount_yi": pick.seal_amount_yi,
                 "industry": pick.industry,
                 "concepts": pick.concepts,
                 "same_topic_limitup_count": pick.same_topic_limitup_count,
@@ -634,11 +775,11 @@ def backtest_relay(pack: DailyPack, *, signal_days: int = 60) -> dict[str, Any]:
             if not 2.0 <= gap_pct <= 6.0:
                 continue
             day1_pre_close = safe_float(pack.matrices["pre_close"][t + 1, code_index]) or prev_close
-            holds_to_day2 = _limit_up(day1_close, day1_pre_close)
+            code = str(pack.codes[code_index])
+            holds_to_day2 = _limit_up(day1_close, day1_pre_close, code)
             exit_index = t + 2 if holds_to_day2 else t + 1
             exit_price = day2_close if holds_to_day2 else day1_close
             trade_return = (exit_price / open_price - 1.0) * 100.0
-            code = str(pack.codes[code_index])
             meta_row = pack.meta.loc[pack.meta["code"].astype(str) == code]
             name = str(meta_row.iloc[0].get("name") or code) if not meta_row.empty else code
             trades.append(
@@ -807,6 +948,7 @@ def screen_auction(
             quotes.append(
                 {
                     **stock,
+                    "board": stock.get("board") or _board_name(code),
                     "opening": quote["opening"],
                     "open_gap_pct": gap_pct,
                     "auction_amount": quote["auction_amount"],

@@ -54,6 +54,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
+dashboard = ["streamlit>=1.35"]
 
 [project.urls]
 Homepage = "https://alphasift.zhulinsen.tech/"

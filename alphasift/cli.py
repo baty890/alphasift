@@ -559,7 +559,10 @@ def main():
         if args.output:
             save_screen_result(result, data_dir=config.data_dir, path=args.output, jsonl=args.jsonl)
         if args.explain:
-            print(_format_screen_explain(result))
+            if result.strategy == "relay_1to2_2to3":
+                print(_format_relay_screen_explain(result))
+            else:
+                print(_format_screen_explain(result))
         elif args.jsonl:
             print("\n".join(screen_result_to_jsonl(result)))
         else:
@@ -1908,6 +1911,44 @@ def _format_screen_explain(result) -> str:
     return "\n".join(lines)
 
 
+def _format_relay_screen_explain(result) -> str:
+    lines = [
+        "首板一进二 / 二进三接力候选报告",
+        f"交易日期：{result.created_at[:10]}  行情来源：新浪  合格候选：{result.after_filter_count}  展示数量：{len(result.picks)}",
+        "代码\t名称\t板块\t连板数\t精选得分\t流通市值(亿)\t换手率\t主力净流入(亿)\t最后封板时间\t炸板次数\t封单金额(亿)\t所属题材\t竞价参考线(亿)\t题材助攻数",
+    ]
+    for ladder, title in ((2, "二进三备选池"), (1, "一进二备选池")):
+        lines.append(f"【{title}】")
+        group = [pick for pick in result.picks if pick.consecutive_limit_ups == ladder]
+        if not group:
+            lines.append("无符合条件的标的")
+            continue
+        for pick in group:
+            topics = "/".join(
+                item for item in [pick.industry, pick.concepts.replace("|", "/")] if item
+            ) or "未映射"
+            circ_mv = "--" if pick.circ_mv is None else f"{pick.circ_mv / 1e8:.2f}"
+            net_inflow = "--" if pick.main_net_inflow is None else f"{pick.main_net_inflow / 1e8:.3f}"
+            auction_reference = "--" if pick.auction_reference is None else f"{pick.auction_reference / 1e8:.2f}"
+            turnover = "--" if pick.turnover_rate is None else f"{pick.turnover_rate:.2f}%"
+            score = f"{pick.final_score:.0f}" if ladder == 1 else "--"
+            seal_time = pick.last_seal_time or "--"
+            broken_count = (
+                "--" if pick.broken_board_count is None else f"{pick.broken_board_count:g}"
+            )
+            seal_amount = (
+                "--" if pick.seal_amount_yi is None else f"{pick.seal_amount_yi:.2f}"
+            )
+            lines.append(
+                f"{pick.code}\t{pick.name}\t{pick.board}\t{ladder}\t{score}\t{circ_mv}\t"
+                f"{turnover}\t{net_inflow}\t{seal_time}\t{broken_count}\t{seal_amount}\t{topics}\t"
+                f"{auction_reference}\t{pick.same_topic_limitup_count}"
+            )
+    if result.degradation:
+        lines.extend(["", "说明：", *[f"- {note}" for note in result.degradation]])
+    return "\n".join(lines)
+
+
 def _format_relay_backtest(result: dict) -> str:
     def pct(value: object) -> str:
         return "--" if value is None else f"{float(value):.2f}%"
@@ -1940,15 +1981,20 @@ def _format_auction_picks(picks: list[dict]) -> str:
     if not picks:
         return "集合竞价未发现符合条件的标的。"
     lines = [
-        "集合竞价强承接目标 Top 3",
-        "代码\t名称\t竞价开盘\t高开幅度\t竞价成交额\t占昨日成交额\t竞价强度\t所属题材",
+        "集合竞价强承接目标前三名",
+        "代码\t名称\t板块\t连板数\t流通市值(亿)\t换手率\t主力净流入(亿)\t所属题材\t竞价参考线(亿)\t竞价开盘价\t高开幅度\t竞价成交额(亿)\t竞价成交额占比\t竞价抢筹强度",
     ]
     for item in picks:
+        circ_mv = "--" if item.get("circ_mv") is None else f"{item['circ_mv'] / 1e8:.2f}"
+        net_inflow = "--" if item.get("main_net_inflow") is None else f"{item['main_net_inflow'] / 1e8:.3f}"
+        turnover = "--" if item.get("turnover_rate") is None else f"{item['turnover_rate']:.2f}%"
+        auction_reference = "--" if item.get("auction_reference") is None else f"{item['auction_reference'] / 1e8:.2f}"
         lines.append(
-            f"{item['code']}\t{item.get('name', '')}\t{item['opening']:.2f}\t"
-            f"{item['open_gap_pct']:.2f}%\t{item['auction_amount'] / 1e8:.2f}亿\t"
-            f"{item['auction_amount_pct']:.2f}%\t{item['intensity']:.2f}\t"
-            f"{item.get('concepts') or item.get('industry') or '未映射'}"
+            f"{item['code']}\t{item.get('name', '')}\t{item.get('board', '主板')}\t"
+            f"{item.get('consecutive_limit_ups', '--')}\t{circ_mv}\t{turnover}\t{net_inflow}\t"
+            f"{item.get('concepts') or item.get('industry') or '未映射'}\t{auction_reference}\t"
+            f"{item['opening']:.2f}\t{item['open_gap_pct']:.2f}%\t{item['auction_amount'] / 1e8:.2f}\t"
+            f"{item['auction_amount_pct']:.2f}%\t{item['intensity']:.2f}"
         )
     return "\n".join(lines)
 
