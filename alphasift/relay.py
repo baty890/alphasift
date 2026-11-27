@@ -30,6 +30,11 @@ STRATEGY_NAME = "relay_1to2_2to3"
 MAX_CANDIDATES = 15
 MIN_AMOUNT = 250_000_000.0
 LIMIT_UP_PCT = 9.5
+FIRST_BOARD_MIN_CIRC_MV = 2_000_000_000.0
+FIRST_BOARD_MAX_CIRC_MV = 15_000_000_000.0
+FIRST_BOARD_MIN_TURNOVER = 3.5
+FIRST_BOARD_MAX_TURNOVER = 16.0
+FIRST_BOARD_MIN_NET_INFLOW = 30_000_000.0
 _CN_TZ = ZoneInfo("Asia/Shanghai")
 _AUCTION_URL = "https://hq.sinajs.cn/list={symbol}"
 
@@ -53,10 +58,86 @@ def candidate_pool_path(config: Config) -> Path:
 
 def _code_is_excluded(code: str, name: str) -> bool:
     cleaned = normalize_code(code)
+    normalized_name = str(name).strip().upper()
     return (
         cleaned.startswith(("688", "4", "8", "92"))
-        or bool(re.match(r"^\*?ST", str(name).strip().upper()))
+        or bool(re.match(r"^(?:\*?ST|退)", normalized_name))
     )
+
+
+def _is_main_board(code: str) -> bool:
+    return code.startswith(("000", "001", "002", "003", "600", "601", "603", "605"))
+
+
+def _row_value(row: dict[str, Any], names: tuple[str, ...]) -> tuple[str, object] | None:
+    for name in names:
+        value = row.get(name)
+        if value is not None and str(value).strip() and str(value).strip().lower() != "nan":
+            return name, value
+    return None
+
+
+def _parse_seal_minutes(value: object) -> int | None:
+    match = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?::\d{2})?(?!\d)", str(value).strip())
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    return hour * 60 + minute
+
+
+def _first_board_seal_fields(row: dict[str, Any]) -> tuple[bool, int | None]:
+    time_field = _row_value(row, ("last_seal_time", "seal_time", "最后封板时间", "封板时间"))
+    seal_minutes = _parse_seal_minutes(time_field[1]) if time_field else None
+    if seal_minutes is not None and seal_minutes > 14 * 60 + 30:
+        return False, seal_minutes
+
+    broken_field = _row_value(row, ("broken_board_count", "炸板次数"))
+    if broken_field:
+        broken_count = safe_float(broken_field[1])
+        if broken_count is not None and broken_count > 2:
+            return False, seal_minutes
+
+    amount_field = _row_value(
+        row,
+        ("seal_amount_yi", "封单金额(亿)", "封单金额（亿）", "seal_amount", "封单金额", "封单额"),
+    )
+    if amount_field:
+        seal_amount = safe_float(amount_field[1])
+        if seal_amount is not None:
+            amount_is_yi = (
+                "亿" in amount_field[0]
+                or amount_field[0] == "seal_amount_yi"
+                or abs(seal_amount) < 10_000
+            )
+            seal_amount_yi = seal_amount if amount_is_yi else seal_amount / 100_000_000.0
+            if seal_amount_yi < 0.2:
+                return False, seal_minutes
+    return True, seal_minutes
+
+
+def _first_board_score(
+    *,
+    topic_count: int,
+    turnover: float,
+    net_inflow: float,
+    seal_minutes: int | None,
+    has_seal_time: bool,
+) -> tuple[float, dict[str, float]]:
+    topic_score = 35.0 if topic_count >= 5 else 20.0 if topic_count >= 3 else 5.0
+    turnover_score = 25.0 if 5.0 <= turnover <= 13.0 else 12.0
+    flow_score = 25.0 if net_inflow >= 80_000_000.0 else 12.0
+    seal_score = 10.0
+    if has_seal_time and seal_minutes is not None:
+        seal_score = 15.0 if seal_minutes < 10 * 60 else 10.0 if seal_minutes < 11 * 60 + 30 else 5.0
+    scores = {
+        "topic_heat": topic_score,
+        "turnover_golden_range": turnover_score,
+        "fund_strength": flow_score,
+        "seal_quality": seal_score,
+    }
+    return sum(scores.values()), scores
 
 
 def _pack_code_index(pack: DailyPack) -> dict[str, int]:
@@ -249,13 +330,27 @@ def screen_relay(
         turnover = safe_float(row.get("turnover_rate"))
         amount = safe_float(row.get("amount"))
         price = safe_float(row.get("price"))
+        if ladder == 1 and not _is_main_board(code):
+            continue
+        market_cap_min, market_cap_max = (
+            (FIRST_BOARD_MIN_CIRC_MV, FIRST_BOARD_MAX_CIRC_MV)
+            if ladder == 1
+            else (2_000_000_000.0, 12_000_000_000.0)
+        )
         if (
-            circ_mv is None or not 2_000_000_000 <= circ_mv <= 12_000_000_000
+            circ_mv is None or not market_cap_min <= circ_mv <= market_cap_max
             or turnover is None or amount is None or price is None or amount < MIN_AMOUNT
         ):
             continue
-        turnover_min, turnover_max = (5.0, 18.0) if ladder == 1 else (8.0, 25.0)
+        turnover_min, turnover_max = (
+            (FIRST_BOARD_MIN_TURNOVER, FIRST_BOARD_MAX_TURNOVER)
+            if ladder == 1
+            else (8.0, 25.0)
+        )
         if not turnover_min <= turnover <= turnover_max:
+            continue
+        seal_passes, seal_minutes = _first_board_seal_fields(row) if ladder == 1 else (True, None)
+        if not seal_passes:
             continue
         prior_amount = safe_float(pack.matrices["amount"][ref_index, code_index])
         health = _turnover_health(turnover, ladder)
@@ -277,15 +372,43 @@ def screen_relay(
                 "industry": str(meta_by_code.loc[code].get("industry", "") if code in meta_by_code.index else ""),
                 "concepts": "",
                 "fund_flow": "",
+                "seal_minutes": seal_minutes,
+                "has_seal_time": _row_value(
+                    row, ("last_seal_time", "seal_time", "最后封板时间", "封板时间")
+                ) is not None,
                 "same_topic_limitup_count": 0,
                 "sector_assist": False,
             }
         )
     candidates.sort(key=lambda item: (-item["pre_score"][0], -item["pre_score"][1], -item["pre_score"][2], item["code"]))
-    finalists = candidates[: min(MAX_CANDIDATES, max_output or MAX_CANDIDATES)]
-
     flow_errors: list[str] = []
-    for item in finalists:
+    for item in (candidate for candidate in candidates if candidate["ladder"] == 1):
+        try:
+            summary = fetch_stock_fund_flow_summary(item["code"])
+        except Exception as exc:
+            summary = ""
+            flow_errors.append(f"{item['code']} 主力资金: {exc}")
+        item["fund_flow"] = summary
+        item["main_net_inflow"] = _parse_main_net_inflow(summary)
+        if not summary or item["main_net_inflow"] is None:
+            flow_errors.append(f"{item['code']} 主力资金: 接口未返回可解析的净流入值")
+    candidates = [
+        item for item in candidates
+        if item["ladder"] != 1
+        or (
+            item["main_net_inflow"] is not None
+            and item["main_net_inflow"] >= FIRST_BOARD_MIN_NET_INFLOW
+        )
+    ]
+
+    second_board_finalists = [
+        item for item in candidates if item["ladder"] == 2
+    ][: min(MAX_CANDIDATES, max_output or MAX_CANDIDATES)]
+    finalists = [
+        *[item for item in candidates if item["ladder"] == 1],
+        *second_board_finalists,
+    ]
+    for item in second_board_finalists:
         try:
             summary = fetch_stock_fund_flow_summary(item["code"])
         except Exception as exc:
@@ -328,18 +451,44 @@ def screen_relay(
             item["same_topic_limitup_count"] = same_topic_count
             item["sector_assist"] = same_topic_count > 1
 
+    for item in finalists:
+        if item["ladder"] == 1:
+            item["selected_score"], item["selection_factors"] = _first_board_score(
+                topic_count=item["same_topic_limitup_count"],
+                turnover=item["turnover_rate"],
+                net_inflow=item["main_net_inflow"],
+                seal_minutes=item["seal_minutes"],
+                has_seal_time=item["has_seal_time"],
+            )
+
     finalists.sort(
         key=lambda item: (
             -item["ladder"],
-            -item["health"],
-            -_main_flow_score(item["main_net_inflow"], item["circ_mv"], item["amount"]),
+            -item["selected_score"] if item["ladder"] == 1 else -item["health"],
+            0.0 if item["ladder"] == 1 else -_main_flow_score(
+                item["main_net_inflow"], item["circ_mv"], item["amount"]
+            ),
             item["code"],
         )
     )
+    finalists = finalists[: min(MAX_CANDIDATES, max_output or MAX_CANDIDATES)]
     picks: list[Pick] = []
     for rank, item in enumerate(finalists, 1):
         flow_ratio = _main_flow_score(item["main_net_inflow"], item["circ_mv"], item["amount"])
-        score = item["ladder"] * 40.0 + item["health"] * 35.0 + min(25.0, max(0.0, flow_ratio * 100.0))
+        score = (
+            item["selected_score"]
+            if item["ladder"] == 1
+            else item["ladder"] * 40.0 + item["health"] * 35.0
+            + min(25.0, max(0.0, flow_ratio * 100.0))
+        )
+        ranking_reason = (
+            f"精选得分={score:.0f}/100；题材热度={item['selection_factors']['topic_heat']:.0f}；"
+            f"换手区间={item['selection_factors']['turnover_golden_range']:.0f}；"
+            f"资金强度={item['selection_factors']['fund_strength']:.0f}；"
+            f"封板质量={item['selection_factors']['seal_quality']:.0f}"
+            if item["ladder"] == 1
+            else f"{item['ladder']}连板优先；换手健康度={item['health']:.2f}；资金强度按流入/流通市值排序"
+        )
         picks.append(
             Pick(
                 rank=rank,
@@ -347,7 +496,7 @@ def screen_relay(
                 name=item["name"],
                 final_score=score,
                 screen_score=score,
-                ranking_reason=f"{item['ladder']}连板优先；换手健康度={item['health']:.2f}；资金强度按流入/流通市值排序",
+                ranking_reason=ranking_reason,
                 price=item["price"],
                 change_pct=item["change_pct"],
                 amount=item["amount"],
@@ -362,14 +511,18 @@ def screen_relay(
                 prior_day_amount=item["prior_day_amount"],
                 industry=item["industry"],
                 concepts=item["concepts"],
-                factor_scores={"turnover_health": item["health"], "flow_intensity": flow_ratio},
+                factor_scores=(
+                    item["selection_factors"]
+                    if item["ladder"] == 1
+                    else {"turnover_health": item["health"], "flow_intensity": flow_ratio}
+                ),
             )
         )
 
     degradation = [
-        "回测与候选筛选只采用本地 DailyPack + Sina 快照；未调用 LLM。",
-        "前15名截断前以成交额/流通市值代理资金强度；截断后才查询真实主力净流入并重排。",
-        f"题材助攻计数范围仅为成功映射题材的前 {len(finalists)} 只候选，不代表全市场涨停家数。",
+        "初筛使用本地 DailyPack + Sina 快照；资金流与题材评分查询东方财富，不调用 LLM。",
+        "一进二先按真实主力净流入硬筛；二进三仍按原候选预排序后查询资金流。",
+        f"题材热度计数范围仅为成功映射题材的候选集合，不代表全市场涨停家数。",
         *notes,
         *flow_errors,
     ]
@@ -411,6 +564,7 @@ def screen_relay(
                 "prior_day_amount": pick.prior_day_amount,
                 "auction_reference": pick.auction_reference,
                 "main_net_inflow": pick.main_net_inflow,
+                "selection_score": pick.final_score if pick.consecutive_limit_ups == 1 else None,
                 "industry": pick.industry,
                 "concepts": pick.concepts,
                 "same_topic_limitup_count": pick.same_topic_limitup_count,

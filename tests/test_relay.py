@@ -14,6 +14,9 @@ from alphasift.config import Config
 from alphasift.pack import DailyPack, FIELDS
 from alphasift.relay import (
     STRATEGY_NAME,
+    _first_board_score,
+    _first_board_seal_fields,
+    _is_main_board,
     backtest_relay,
     screen_auction,
     screen_relay,
@@ -99,22 +102,59 @@ def test_relay_screens_top_15_and_only_enriches_final_candidates(tmp_path: Path,
 
     assert result.snapshot_source == "sina"
     assert not result.llm_ranked
-    assert result.after_filter_count == 22
+    assert result.after_filter_count == 21
     assert len(result.picks) == 15
-    assert len(calls) == 15
-    assert set(calls) == {pick.code for pick in result.picks}
+    assert len(calls) == 21
+    assert {pick.code for pick in result.picks}.issubset(set(calls))
     assert all(not pick.code.startswith(("688", "4", "8")) for pick in result.picks)
     assert all(not pick.name.startswith("ST") for pick in result.picks)
     assert all(pick.consecutive_limit_ups == 2 for pick in result.picks[:9])
     assert all(pick.consecutive_limit_ups == 1 for pick in result.picks[9:])
-    assert all(pick.sector_assist and pick.same_topic_limitup_count == 15 for pick in result.picks)
+    assert all(pick.sector_assist and pick.same_topic_limitup_count == 21 for pick in result.picks)
     assert result.picks[0].concepts == "题材甲|共同主题"
     assert result.picks[0].main_net_inflow == 100_000_000.0
+    assert all(
+        pick.final_score == sum(pick.factor_scores.values())
+        for pick in result.picks
+        if pick.consecutive_limit_ups == 1
+    )
     pool = __import__("json").loads((tmp_path / "relay" / "candidate_pool.json").read_text(encoding="utf-8"))
     assert len(pool["stocks"]) == 15
     assert pool["is_final"] is False
     assert pool["pool_status"] == "provisional_intraday"
     assert pool["stocks"][0]["auction_reference"] == 35_000_000.0
+    assert all(
+        "selection_score" in stock for stock in pool["stocks"]
+        if stock["consecutive_limit_ups"] == 1
+    )
+
+
+def test_first_board_filters_and_score_defaults():
+    assert _is_main_board("000001")
+    assert _is_main_board("600000")
+    assert not _is_main_board("300001")
+    assert not _is_main_board("688001")
+    assert _first_board_seal_fields({}) == (True, None)
+    assert _first_board_seal_fields({"最后封板时间": "14:30:00"}) == (True, 870)
+    assert not _first_board_seal_fields({"最后封板时间": "14:30:01"})[0]
+    assert not _first_board_seal_fields({"炸板次数": 3})[0]
+    assert not _first_board_seal_fields({"封单金额": 19_999_999})[0]
+    assert _first_board_seal_fields({"封单金额": 0.2})[0]
+
+    score, factors = _first_board_score(
+        topic_count=5,
+        turnover=13.0,
+        net_inflow=80_000_000.0,
+        seal_minutes=None,
+        has_seal_time=False,
+    )
+    assert score == 95.0
+    assert factors == {
+        "topic_heat": 35.0,
+        "turnover_golden_range": 25.0,
+        "fund_strength": 25.0,
+        "seal_quality": 10.0,
+    }
 
 
 def _pack_for_backtest() -> DailyPack:
