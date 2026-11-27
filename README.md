@@ -205,7 +205,7 @@ alphasift daily-report --pack-dir ./data/pack/cn --output-html daily_report.html
 | `low_volatility_quality` | `cn` | 质量防御 | 基于日 K 20 日波动率、最大回撤与 ATR 的低波防线 |
 | `balanced_alpha` | `cn` | 均衡框架 | 跨因子综合发现，强制行业正交分散 |
 | `sina_rule_based` | `cn` | 新浪量化 | Sina 快照 + 市值/换手/涨幅硬筛，最多 20 只候选并串行获取东方财富资金流与行业题材 |
-| `relay_1to2_2to3` | `cn` | 连板接力 | 本地日线包 + Sina 识别首板/二板，候选前 15 串行补充东财资金/题材；每日 GitHub Actions 盘后运行 |
+| `relay_1to2_2to3` | `cn` | 连板接力 | 主板涨幅≥9.5%、创业板≥19.5%识别首板/二板，前 15 候选串行补充东财资金/题材；每日 GitHub Actions 盘后运行 |
 | `momentum_quality` | `cn` | 趋势质量 | 60 日中期趋势确认 + 基本面质量硬过滤 |
 | `shrink_pullback` | `cn` | 回踩趋势 | 上升趋势中缩量回踩支撑位（需日 K） |
 | `capital_heat` | `cn` | 资金动量 | 换手与量比活跃但剔除短期过热追高 |

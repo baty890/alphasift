@@ -1,6 +1,6 @@
 name: relay_1to2_2to3
 display_name: 首板一进二 / 二进三接力
-description: 使用本地日线包和新浪快照识别首板、二板；仅对前15只候选补充东方财富资金流与题材
+description: 主板涨幅不低于9.5%、创业板不低于19.5%识别首板和二板；仅对前15只候选补充东方财富资金流与题材
 version: "1.0"
 category: framework
 tags: [rule_based, relay, limit_up, sina_snapshot]
@@ -22,5 +22,5 @@ screening:
     market_cap_max: 12000000000
     turnover_rate_min: 5.0
     change_pct_min: 9.5
-  ranking_hints: 连板梯队优先，结合换手健康度与资金强度排序；仅规则筛选，不启用LLM
+  ranking_hints: 主板涨幅不低于9.5%、创业板涨幅不低于19.5%；连板梯队优先，结合换手健康度与资金强度排序；仅规则筛选，不启用LLM
   max_output: 15

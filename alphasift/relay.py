@@ -29,7 +29,9 @@ from alphasift.timeutil import now_iso
 STRATEGY_NAME = "relay_1to2_2to3"
 MAX_CANDIDATES = 15
 MIN_AMOUNT = 250_000_000.0
-LIMIT_UP_PCT = 9.5
+MAIN_BOARD_LIMIT_UP_PCT = 9.5
+CHINEXT_LIMIT_UP_PCT = 19.5
+_PCT_FLOAT_TOLERANCE = 0.0001
 _CN_TZ = ZoneInfo("Asia/Shanghai")
 _AUCTION_URL = "https://hq.sinajs.cn/list={symbol}"
 
@@ -59,16 +61,28 @@ def _code_is_excluded(code: str, name: str) -> bool:
     )
 
 
+def _is_chinext(code: str) -> bool:
+    return normalize_code(code).startswith(("300", "301"))
+
+
+def _board_name(code: str) -> str:
+    return "创业板" if _is_chinext(code) else "主板"
+
+
+def _limit_up_threshold(code: str) -> float:
+    return CHINEXT_LIMIT_UP_PCT if _is_chinext(code) else MAIN_BOARD_LIMIT_UP_PCT
+
+
 def _pack_code_index(pack: DailyPack) -> dict[str, int]:
     return {str(code): index for index, code in enumerate(pack.codes)}
 
 
-def _limit_up(close: float, pre_close: float) -> bool:
+def _limit_up(close: float, pre_close: float, code: str) -> bool:
     return (
         math.isfinite(close)
         and math.isfinite(pre_close)
         and pre_close > 0
-        and (close / pre_close - 1.0) * 100.0 >= LIMIT_UP_PCT
+        and (close / pre_close - 1.0) * 100.0 >= _limit_up_threshold(code) - _PCT_FLOAT_TOLERANCE
     )
 
 
@@ -86,9 +100,10 @@ def _bar_change(pack: DailyPack, day_index: int, code_index: int) -> float | Non
 
 def _streak_through_day(pack: DailyPack, day_index: int, code_index: int) -> int:
     streak = 0
+    threshold = _limit_up_threshold(str(pack.codes[code_index]))
     for index in range(day_index, -1, -1):
         change = _bar_change(pack, index, code_index)
-        if change is None or change < LIMIT_UP_PCT:
+        if change is None or change < threshold - _PCT_FLOAT_TOLERANCE:
             break
         streak += 1
     return streak
@@ -239,7 +254,7 @@ def screen_relay(
         if code_index is None:
             continue
         change_pct = safe_float(row.get("change_pct"))
-        if change_pct is None or change_pct < LIMIT_UP_PCT:
+        if change_pct is None or change_pct < _limit_up_threshold(code):
             continue
         previous_streak = _streak_through_day(pack, previous_index, code_index)
         ladder = previous_streak + 1
@@ -263,6 +278,7 @@ def screen_relay(
             {
                 "code": code,
                 "name": name,
+                "board": _board_name(code),
                 "ladder": ladder,
                 "price": price,
                 "change_pct": change_pct,
@@ -352,6 +368,7 @@ def screen_relay(
                 change_pct=item["change_pct"],
                 amount=item["amount"],
                 fund_flow=item["fund_flow"],
+                board=item["board"],
                 circ_mv=item["circ_mv"],
                 turnover_rate=item["turnover_rate"],
                 main_net_inflow=item["main_net_inflow"],
@@ -404,6 +421,7 @@ def screen_relay(
             {
                 "code": pick.code,
                 "name": pick.name,
+                "board": pick.board,
                 "consecutive_limit_ups": pick.consecutive_limit_ups,
                 "circ_mv": pick.circ_mv,
                 "turnover_rate": pick.turnover_rate,
@@ -480,11 +498,11 @@ def backtest_relay(pack: DailyPack, *, signal_days: int = 60) -> dict[str, Any]:
             if not 2.0 <= gap_pct <= 6.0:
                 continue
             day1_pre_close = safe_float(pack.matrices["pre_close"][t + 1, code_index]) or prev_close
-            holds_to_day2 = _limit_up(day1_close, day1_pre_close)
+            code = str(pack.codes[code_index])
+            holds_to_day2 = _limit_up(day1_close, day1_pre_close, code)
             exit_index = t + 2 if holds_to_day2 else t + 1
             exit_price = day2_close if holds_to_day2 else day1_close
             trade_return = (exit_price / open_price - 1.0) * 100.0
-            code = str(pack.codes[code_index])
             meta_row = pack.meta.loc[pack.meta["code"].astype(str) == code]
             name = str(meta_row.iloc[0].get("name") or code) if not meta_row.empty else code
             trades.append(
@@ -653,6 +671,7 @@ def screen_auction(
             quotes.append(
                 {
                     **stock,
+                    "board": stock.get("board") or _board_name(code),
                     "opening": quote["opening"],
                     "open_gap_pct": gap_pct,
                     "auction_amount": quote["auction_amount"],

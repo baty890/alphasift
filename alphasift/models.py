@@ -227,6 +227,7 @@ class Pick:
     sector_assist: bool = False
     auction_reference: float | None = None
     prior_day_amount: float | None = None
+    board: str = ""
 
 
 @dataclass

@@ -51,6 +51,7 @@ SCREEN_RESULT_SCHEMA: dict[str, object] = {
         "ranking_reason",
         "risk_summary",
         "circ_mv",
+        "board",
         "main_net_inflow",
         "consecutive_limit_ups",
         "same_topic_limitup_count",

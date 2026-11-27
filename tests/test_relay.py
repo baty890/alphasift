@@ -14,6 +14,8 @@ from alphasift.config import Config
 from alphasift.pack import DailyPack, FIELDS
 from alphasift.relay import (
     STRATEGY_NAME,
+    _limit_up,
+    _streak_through_day,
     backtest_relay,
     screen_auction,
     screen_relay,
@@ -48,7 +50,10 @@ def test_relay_screens_top_15_and_only_enriches_final_candidates(tmp_path: Path,
     valid_codes = [f"{number:06d}" for number in range(1, 21)]
     boundary_codes = ["000022", "000023"]
     rejected_codes = [f"{number:06d}" for number in range(24, 30)]
-    codes = [*valid_codes, *boundary_codes, *rejected_codes, "000021", "688001", "830001"]
+    codes = [
+        *valid_codes, *boundary_codes, *rejected_codes, "000021", "688001", "830001",
+        "300001", "300002",
+    ]
     two_boards = {*valid_codes[:8], "000023"}
     pack = _pack_for_screen(codes, two_boards)
     rows = []
@@ -79,6 +84,8 @@ def test_relay_screens_top_15_and_only_enriches_final_candidates(tmp_path: Path,
             {"code": "000021", "name": "ST样本", "price": 11, "change_pct": 10, "amount": 3e8, "turnover_rate": 10, "circ_mv": 5e9},
             {"code": "688001", "name": "科创样本", "price": 11, "change_pct": 10, "amount": 3e8, "turnover_rate": 10, "circ_mv": 5e9},
             {"code": "830001", "name": "北交所样本", "price": 11, "change_pct": 10, "amount": 3e8, "turnover_rate": 10, "circ_mv": 5e9},
+            {"code": "300001", "name": "创业板涨停", "price": 12, "change_pct": 19.5, "amount": 350_000_000, "turnover_rate": 11.5, "circ_mv": 5e9},
+            {"code": "300002", "name": "创业板普通大阳线", "price": 11, "change_pct": 10, "amount": 350_000_000, "turnover_rate": 11.5, "circ_mv": 5e9},
         ]
     )
     snapshot = pd.DataFrame(rows)
@@ -99,11 +106,16 @@ def test_relay_screens_top_15_and_only_enriches_final_candidates(tmp_path: Path,
 
     assert result.snapshot_source == "sina"
     assert not result.llm_ranked
-    assert result.after_filter_count == 22
+    assert result.after_filter_count == 23
     assert len(result.picks) == 15
     assert len(calls) == 15
     assert set(calls) == {pick.code for pick in result.picks}
     assert all(not pick.code.startswith(("688", "4", "8")) for pick in result.picks)
+    chinext_pick = next(pick for pick in result.picks if pick.code == "300001")
+    assert chinext_pick.board == "创业板"
+    assert chinext_pick.consecutive_limit_ups == 1
+    assert all(pick.board == "主板" for pick in result.picks if not pick.code.startswith(("300", "301")))
+    assert "300002" not in {pick.code for pick in result.picks}
     assert all(not pick.name.startswith("ST") for pick in result.picks)
     assert all(pick.consecutive_limit_ups == 2 for pick in result.picks[:9])
     assert all(pick.consecutive_limit_ups == 1 for pick in result.picks[9:])
@@ -115,6 +127,48 @@ def test_relay_screens_top_15_and_only_enriches_final_candidates(tmp_path: Path,
     assert pool["is_final"] is False
     assert pool["pool_status"] == "provisional_intraday"
     assert pool["stocks"][0]["auction_reference"] == 35_000_000.0
+
+
+def test_board_specific_limit_up_thresholds():
+    assert _limit_up(10.95, 10.0, "600001")
+    assert not _limit_up(11.0, 10.0, "300001")
+    assert _limit_up(11.95, 10.0, "300001")
+
+    main_board_pack = _pack_for_screen(["600001"], {"600001"})
+    chinext_pack = _pack_for_screen(["300001"], {"300001"})
+    assert _streak_through_day(main_board_pack, 1, 0) == 1
+    assert _streak_through_day(chinext_pack, 1, 0) == 0
+
+
+def test_relay_explain_uses_simplified_chinese_headers_and_board_label():
+    from alphasift.cli import _format_relay_screen_explain
+    from alphasift.models import Pick, ScreenResult
+
+    pick = Pick(
+        rank=1,
+        code="300001",
+        name="创业板样本",
+        final_score=100,
+        screen_score=100,
+        board="创业板",
+        consecutive_limit_ups=1,
+        circ_mv=5_000_000_000,
+        turnover_rate=11.5,
+        main_net_inflow=120_000_000,
+        concepts="算力|人工智能",
+        auction_reference=35_000_000,
+        same_topic_limitup_count=3,
+    )
+    result = ScreenResult(
+        strategy=STRATEGY_NAME,
+        market="cn",
+        after_filter_count=1,
+        picks=[pick],
+    )
+
+    report = _format_relay_screen_explain(result)
+    assert "代码\t名称\t板块\t连板数\t流通市值(亿)\t换手率\t主力净流入(亿)\t所属题材\t竞价参考线(亿)\t题材助攻数" in report
+    assert "300001\t创业板样本\t创业板\t1\t50.00\t11.50%\t1.200\t算力/人工智能\t0.35\t3" in report
 
 
 def _pack_for_backtest() -> DailyPack:
